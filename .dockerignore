@@ -1,0 +1,37 @@
+# Keep the build context small and never ship local venvs, caches, or secrets.
+.git
+.github
+.venv
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.hypothesis
+.mypy_cache
+htmlcov
+.coverage
+.coverage.*
+coverage.xml
+*.egg-info
+dist
+build
+
+# Tests are not needed in the runtime image.
+tests
+
+# Local secrets / env and the local snapshot store.
+.env
+.env.*
+!.env.example
+.delphi
+
+# Infra + docs that don't belong in the image.
+deploy
+docker-compose.yml
+# README.md is referenced by pyproject ([project].readme) and required to build
+# the wheel, so exclude other markdown but keep it.
+*.md
+!README.md
+
+# OS cruft.
+.DS_Store

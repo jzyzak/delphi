@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Or pass with -var / TF_VAR_*.
+aws_region = "us-east-1"
+
+# Required secrets (stored in AWS Secrets Manager, never in the image):
+anthropic_api_key = "sk-ant-..."
+tavily_api_key    = "tvly-..."
+
+# Bearer token clients must send. Leave unset ("") to have a strong one generated
+# (read it back with: terraform output -raw api_token).
+api_token = ""
+
+# Optional: switch the model transport to in-VPC Bedrock (needs Bedrock-style
+# model ids via model_overrides + model access granted in the account).
+# llm_provider = "bedrock"
+# model_overrides = {
+#   DELPHI_MODEL_OPUS  = "anthropic.claude-opus-4-8"
+#   DELPHI_MODEL_FABLE = "us.anthropic.claude-fable-5"
+# }

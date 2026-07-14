@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.mypy_cache/
+htmlcov/
+# Broad pattern: also catches Finder/iCloud duplicates like ".coverage 2"
+.coverage*
+coverage.xml
+*.egg-info/
+dist/
+build/
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!**/*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Secrets / local env (never commit real credentials; .env.example is tracked)
+.env
+.env.*
+!.env.example
+
+# Local evidence snapshot store (default dev location)
+.delphi/
+
+# OS
+.DS_Store
+# Finder/iCloud sync duplicates ("file 2.ext") — never stage these
+* 2
+* 2.*

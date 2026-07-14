@@ -1,0 +1,33 @@
+# Local Postgres spine for DELPHI (CLAUDE.md §7: one Postgres, pgvector for
+# memory + the bitemporal store). Migrations auto-apply on first connect via
+# each store's connect(..., migrate=True), so no migration runner is needed.
+#
+#   docker compose up -d
+#   export DELPHI_PG_DSN="postgresql://postgres:delphi@localhost:5432/delphi"
+#
+# The host port defaults to 5432 but is overridable via DELPHI_PG_PORT (read from
+# .env) when 5432 is already taken by another Postgres; set DELPHI_PG_DSN to the
+# same port. The image bundles the pgvector extension required by core/memory.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: delphi-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: delphi
+      POSTGRES_DB: delphi
+    ports:
+      - "${DELPHI_PG_PORT:-5432}:5432"
+    volumes:
+      - delphi-pgdata:/var/lib/postgresql/data
+      # Enables the pgvector extension on first DB init (core/memory needs it).
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d delphi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  delphi-pgdata:
