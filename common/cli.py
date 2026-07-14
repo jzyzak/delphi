@@ -22,6 +22,7 @@ from benchmarks.live_loop.harvest import HarvestJob
 from benchmarks.live_loop.score import ScoreJob
 from common.doctor import Probe, format_report, run_checks
 from conductor.heuristic import HeuristicConductor
+from core.orchestration.meta.holdout import HoldoutGovernor
 from core.orchestration.run_state import RunStateStore
 from core.registry.store import InMemoryRegistryStore, RegistryStore
 from evaluation.report import EvalContext, render_leakage_audit, render_report
@@ -78,11 +79,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional ISO-8601 timestamp; only resolve questions intook at/after it.",
     )
-    resolve.add_argument(
+    resolve_source = resolve.add_mutually_exclusive_group()
+    resolve_source.add_argument(
         "--answers",
         dest="answers",
         default=None,
         help="Path to a JSON answer key (question_id -> {value, resolved_at, ...}).",
+    )
+    resolve_source.add_argument(
+        "--suite",
+        dest="suite",
+        default=None,
+        choices=_EVAL_SUITES,
+        help="Resolve from a benchmark suite's resolved questions (network).",
     )
 
     eval_parser = sub.add_parser("eval", help="Proper scores + baselines + CIs + leakage audit.")
@@ -275,6 +284,11 @@ def cmd_serve(args: argparse.Namespace, *, app: DelphiApp) -> int:
     """Serve the published API, or (with ``--check``) verify health and exit."""
     status, _payload = app.handle("GET", "/healthz")
     print(f"DELPHI API health={status} host={args.host} port={args.port}")
+    if not app.auth_enabled:
+        print(
+            "WARNING: DELPHI_SECRET_API_TOKEN not set - serving an UNAUTHENTICATED "
+            "endpoint (local development only; api/wsgi.py refuses to start without it)."
+        )
     if args.check:
         return 0 if status == 200 else 1
     from api.server import serve  # pragma: no cover - binds a socket
@@ -360,6 +374,42 @@ def _default_forecaster() -> Forecaster:  # pragma: no cover - requires LLM API 
 _EVAL_SUITES = ("metaculus", "forecastbench")
 
 
+def _holdout_governor_from_env(
+    env: dict[str, str] | None = None,
+) -> HoldoutGovernor | None:
+    """Optional guarded-holdout wiring for ``delphi eval`` (CLAUDE.md §2.2).
+
+    Fail-closed by default: returns ``None`` (the harness then refuses every
+    holdout access) unless BOTH ``DELPHI_HOLDOUT_FILE`` (path to a JSON payload)
+    and ``DELPHI_HOLDOUT_BUDGET`` (max logged accesses) are set. Every access
+    through the returned governor is hash-chain logged and debits the budget.
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    from core.orchestration.meta.holdout import (
+        InMemoryHoldoutGovernor,
+        StaticHoldoutSource,
+    )
+
+    e = env if env is not None else dict(os.environ)
+    file_path = e.get("DELPHI_HOLDOUT_FILE")
+    budget_raw = e.get("DELPHI_HOLDOUT_BUDGET")
+    if not file_path or not budget_raw:
+        return None
+    try:
+        budget = int(budget_raw)
+    except ValueError as exc:
+        msg = f"DELPHI_HOLDOUT_BUDGET must be an integer, got {budget_raw!r}."
+        raise ValueError(msg) from exc
+    payload = json.loads(Path(file_path).read_text())
+    if not isinstance(payload, dict):
+        msg = f"DELPHI_HOLDOUT_FILE must contain a JSON object, got {type(payload).__name__}."
+        raise ValueError(msg)
+    return InMemoryHoldoutGovernor(budget=budget, source=StaticHoldoutSource(payload))
+
+
 def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - network + LLM + DB
     """Wire a retrospective evaluation suite (fetch -> adapter -> forecast -> score).
 
@@ -422,7 +472,7 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
     return build_eval_context(
         adapter,
         forecast_fn,
-        harness=EvalHarness(budget_ledger=ledger),
+        harness=EvalHarness(budget_ledger=ledger, holdout=_holdout_governor_from_env()),
         judge=judge,
         extra_baselines=tuple(baselines),
     )
@@ -430,11 +480,58 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
 
 def _default_resolution_service(
     answers: str | None = None,
-) -> ResolutionService:  # pragma: no cover - requires Postgres
-    from resolution.sources import MappingResolutionSource, load_mapping_source
+    *,
+    suite: str | None = None,
+) -> ResolutionService:  # pragma: no cover - requires Postgres (and network for --suite)
+    from resolution.benchmark_source import BenchmarkResolutionSource
+    from resolution.sources import (
+        MappingResolutionSource,
+        ResolutionSource,
+        load_mapping_source,
+    )
 
-    source = load_mapping_source(answers) if answers else MappingResolutionSource({})
+    source: ResolutionSource
+    if suite is not None:
+        source = BenchmarkResolutionSource(_fetch_benchmark_resolutions(suite))
+    elif answers:
+        source = load_mapping_source(answers)
+    else:
+        source = MappingResolutionSource({})
     return ResolutionService(store=_default_store(), source=source)
+
+
+def _fetch_benchmark_resolutions(suite: str):  # pragma: no cover - network
+    """Fetch a suite's resolved questions as registry resolutions (same wiring
+    as the live loop's scoring phase in ``_default_live_context``)."""
+    import os
+
+    from benchmarks.fetchers import ForecastBenchFetcher, MetaculusFetcher
+    from benchmarks.forecastbench import ForecastBenchAdapter
+    from benchmarks.metaculus import MetaculusAdapter
+    from common.http.client import HttpClient
+    from common.http.config import HttpConfig
+    from common.secrets import EnvSecretProvider
+    from common.settings import load_settings
+
+    settings = load_settings()
+    http = HttpClient(config=HttpConfig(user_agent=settings.http_user_agent))
+    if suite == "metaculus":
+        records = MetaculusFetcher(http=http, secrets=EnvSecretProvider()).fetch(
+            params={"statuses": "resolved", "forecast_type": "binary", "limit": 100},
+            max_pages=5,
+        )
+        return MetaculusAdapter.from_records(records).resolutions()
+    if suite == "forecastbench":
+        question_set = os.environ["DELPHI_FORECASTBENCH_QUESTION_SET"]
+        resolution_set = os.environ.get("DELPHI_FORECASTBENCH_RESOLUTION_SET")
+        if resolution_set is None:
+            return ()
+        fb = ForecastBenchFetcher(http=http)
+        records = fb.fetch(question_set=question_set, resolution_set=resolution_set)
+        return ForecastBenchAdapter.from_records(records).resolutions()
+    valid = ", ".join(_EVAL_SUITES)
+    msg = f"unknown --suite {suite!r}; choose one of: {valid}."
+    raise ValueError(msg)
 
 
 def _default_doctor_checks() -> list[tuple[str, Probe]]:  # pragma: no cover - probes hit infra
@@ -627,11 +724,18 @@ def main(
             forecaster=forecaster if forecaster is not None else _default_forecaster(),
         )
     if args.command == "resolve":
+        if resolution_service is None and args.answers is None and args.suite is None:
+            print(
+                "Nothing to resolve from: pass --answers FILE or --suite "
+                + "|".join(_EVAL_SUITES)
+                + "."
+            )
+            return 2
         return cmd_resolve(
             args,
             service=resolution_service
             if resolution_service is not None
-            else _default_resolution_service(args.answers),
+            else _default_resolution_service(args.answers, suite=args.suite),
         )
     if args.command == "eval":
         if eval_context is None:

@@ -55,6 +55,11 @@ class DelphiApp:
         self._service = service
         self._auth_token = auth_token
 
+    @property
+    def auth_enabled(self) -> bool:
+        """True when forecast routes require a bearer token (False = open, dev only)."""
+        return self._auth_token is not None
+
     def handle(
         self,
         method: str,

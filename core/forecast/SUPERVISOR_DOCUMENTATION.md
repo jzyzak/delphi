@@ -739,8 +739,8 @@ Per-public-function happy / boundary / failure coverage for `detect_disagreement
 
 | Item | Status | Work required |
 |------|--------|---------------|
-| **Production `SupervisorLLM` implementation** | Not built | Structured JSON prompt eliciting `probability` + `confidence` + `reasoning` from disagreement context + evidence snippets. Bedrock or Anthropic API via thin agent loop. |
-| **Wire supervisor into the application forecaster** | Not wired | After the forecaster produces an ensemble, call `Supervisor.reconcile()`. Thread `question` into `ensemble.provenance`. |
+| **Production `SupervisorLLM` implementation** | **Built** | `BedrockSupervisorLLM` (`core/forecast/supervisor.py`) elicits structured `probability` + `confidence` + `reasoning` over the tiered structured client; injected by `_default_forecaster()` in `common/cli.py`. |
+| **Wire supervisor into the application forecaster** | **Wired** | `forecaster/stages/aggregate.py` (`reconcile()`) runs `Supervisor.reconcile()` inside the `forecaster/chain.py` pipeline; `common/cli.py` supplies the production supervisor LLM. |
 | **`calibrate_ensemble()` adapter for `ReconciledForecast`** | Manual today | Add `calibrate_reconciled(reconciled, ensemble)` helper or a `calibrated_forecast()` one-call wrapper. |
 | **Orchestrator hook** | Not wired | Prompt 16 orchestrator should chain: search → ensemble → supervisor → calibrate. |
 | **Registry logging** | Not implemented | Log `ReconciledForecast` to experiment registry with code hash, model versions, disagreement kind, applied flag. |

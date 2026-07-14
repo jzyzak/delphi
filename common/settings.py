@@ -96,7 +96,7 @@ class Settings(BaseModel):
     actually needed but absent.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, protected_namespaces=())
 
     pg_dsn: str | None = Field(
         default=None,

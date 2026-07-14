@@ -83,9 +83,9 @@ forecast/                          application layer
 ├── leakage_judge.py    ◄────────── leakage_judge re-export shim
 ├── leakage_validation.py            extraction + search trace builders
 ├── leakage_batch.py                 agentic search (inline audit wired)
-├── trace_from_ensemble              extraction (builder available, not wired)
-└── trace_from_supervisor            forecaster (builder available, not wired)
-                                     supervisor via forecast/supervisor.py (builder available, not wired)
+├── trace_from_ensemble              wired — audited in forecaster/stages/leakage_gate.py
+└── trace_from_supervisor            wired — audited in forecaster/stages/leakage_gate.py
+                                     (both traces run through the leakage gate in forecaster/chain.py)
 ```
 
 ### Data flow
@@ -574,24 +574,25 @@ The judge **does not** re-validate that corpus evidence has `knowledge_time ≤ 
 
 ## 14. Testing: acceptance suite LJ1–LJ7
 
-Tests live in `tests/forecast/test_leakage_*.py`. All use `FixtureLeakageJudgeLLM` — no live LLM.
+Judge behavior is exercised through the paths that consume it — the forecaster's
+leakage gate (`tests/forecaster/test_leakage_gate.py`) and the evaluation-suite
+leakage audit (`tests/evaluation/test_leakage_audit.py`). All use
+`FixtureLeakageJudgeLLM` — no live LLM.
 
 | ID | File | Behavior asserted |
 |----|------|-------------------|
-| **LJ1** | `test_leakage_judge.py` | High recall: planted leaks flagged; clean traces unflagged |
-| **LJ2** | `test_leakage_validation.py` | Recall/precision recorded; noisy precision accepted |
-| **LJ3** | `test_leakage_judge.py` | Same judge audits extraction, ensemble, search, supervisor traces |
-| **LJ4** | `test_leakage_judge.py` | Flagged → quarantine with `disposition=pending`; clean → no record |
-| **LJ5** | `test_leakage_batch.py` | Per-component + aggregate rates; planted regression surfaced |
-| **LJ6** | `test_leakage_judge.py` | Misdated doc / hallucinated future fact caught (defense-in-depth) |
-| **LJ7** | `test_leakage_judge.py` | Deterministic audits with fixture judge |
+| **LJ1** | `tests/forecaster/test_leakage_gate.py` | Planted post-as-of leak in a pipeline trace is flagged; clean traces pass unflagged |
+| **LJ4** | `tests/forecaster/test_leakage_gate.py` | Flagged trace → forecast quarantined (and `tests/forecaster/test_chain_e2e.py` proves a quarantined forecast still writes a complete record) |
+| **LJ5** | `tests/evaluation/test_leakage_audit.py` | Suite-level leakage rate + clean fraction computed; all-clean suite yields zero rate; audit report renders the rate |
 
-Prompt 20 search tests (AS3, at the application layer) updated for `{flagged, rationale}` verdict shape.
+The remaining LJ2/LJ3/LJ6/LJ7 acceptance behaviors (recall/precision validation
+harness, multi-producer trace audits, misdated-doc defense-in-depth, determinism
+as a standalone suite) do not yet have dedicated test files.
 
 Run:
 
 ```bash
-uv run pytest tests/forecast/test_leakage_judge.py tests/forecast/test_leakage_validation.py tests/forecast/test_leakage_batch.py
+uv run pytest tests/forecaster/test_leakage_gate.py tests/evaluation/test_leakage_audit.py
 ```
 
 ---
@@ -604,7 +605,7 @@ These items are **in scope for prompt 22's design** but **not yet implemented** 
 
 | Item | Status |
 |------|--------|
-| Haiku-class Bedrock judge implementing `LeakageJudgeLLM` | Not built — only `FixtureLeakageJudgeLLM` |
+| Bedrock judge implementing `LeakageJudgeLLM` | **Built + wired** — `BedrockLeakageJudgeLLM` (`core/forecast/leakage_judge.py`), injected into the forecaster's leakage gate via `_default_forecaster()` in `common/cli.py`; `FixtureLeakageJudgeLLM` remains the hermetic test double |
 | Prompt template file for `leakage_judge_v1` | Constant exists; no template artifact |
 | Content-addressed cache of judge outputs (like extraction/search caches) | Not built |
 | Batch API integration for high-volume audits | Not built |
@@ -614,8 +615,8 @@ These items are **in scope for prompt 22's design** but **not yet implemented** 
 | Producer | Action needed |
 |----------|---------------|
 | **Extraction (12)** | Call `audit_and_quarantine` after the application's extraction step; attach verdict to its extraction result |
-| **Ensemble (18)** | Audit `trace_from_ensemble` in the application's ensemble-forecast path; block or quarantine flagged ensembles |
-| **Supervisor (21)** | Audit `trace_from_supervisor` in `Supervisor.reconcile`; quarantine flagged reconciliations |
+| **Ensemble (18)** | **Wired** — `forecaster/stages/leakage_gate.py` audits `trace_from_ensemble` in the pipeline; flagged forecasts are quarantined |
+| **Supervisor (21)** | **Wired** — `forecaster/stages/leakage_gate.py` audits `trace_from_supervisor` after reconciliation; flagged forecasts are quarantined |
 
 ### Quarantine → Research Director (17)
 

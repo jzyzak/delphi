@@ -39,8 +39,9 @@ uv run pyright         # types
   number is the single worst offense in this codebase (CLAUDE.md §2.2).
 - **Tests are hermetic and deterministic.** Seed all randomness, freeze the as-of clock,
   and mock every network/LLM/provider call. A flaky test is a failing test.
-- **Coverage floor:** ≥90% line-and-branch repo-wide; 100% on `core/pit/`,
-  `core/forecast/`, `core/registry/`, and `evaluation/`.
+- **Coverage floor (CI-enforced):** ≥90% line-and-branch repo-wide; 100% on `evaluation/`.
+  `core/pit/`, `core/forecast/`, and `core/registry/` are ratcheting toward 100% — do not
+  let them regress.
 
 ## Non-negotiable design rules
 

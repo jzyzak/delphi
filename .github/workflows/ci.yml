@@ -28,5 +28,8 @@ jobs:
       - name: Pyright
         run: uv run pyright
 
-      - name: Pytest
-        run: uv run pytest -q
+      - name: Pytest (with coverage floor)
+        run: uv run pytest -q --cov --cov-fail-under=90
+
+      - name: Coverage 100% on evaluation harness
+        run: uv run coverage report --include="evaluation/*" --fail-under=100

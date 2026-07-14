@@ -383,3 +383,117 @@ class TestParser:
     def test_missing_command_errors(self) -> None:
         with pytest.raises(SystemExit):
             build_parser().parse_args([])
+
+
+class TestResolveSourceSelection:
+    def test_no_source_prints_hint_and_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        code = main(["resolve"])
+        out = capsys.readouterr().out
+        assert code == 2
+        assert "Nothing to resolve from" in out
+        assert "--answers" in out
+        assert "--suite" in out
+
+    def test_answers_and_suite_are_mutually_exclusive(self) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["resolve", "--answers", "x.json", "--suite", "metaculus"])
+
+    def test_unknown_suite_rejected_by_parser(self) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["resolve", "--suite", "not-a-suite"])
+
+    def test_suite_flag_reaches_injected_service(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from resolution.service import ResolutionService
+        from resolution.sources import MappingResolutionSource
+
+        service = ResolutionService(
+            store=InMemoryRegistryStore(), source=MappingResolutionSource({})
+        )
+        code = main(["resolve", "--suite", "metaculus"], resolution_service=service)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "RESOLVED 0 question(s)" in out
+
+
+class TestHoldoutGovernorFromEnv:
+    def test_unconfigured_returns_none(self) -> None:
+        from common.cli import _holdout_governor_from_env
+
+        assert _holdout_governor_from_env(env={}) is None
+
+    def test_partial_config_returns_none(self, tmp_path) -> None:
+        from common.cli import _holdout_governor_from_env
+
+        payload = tmp_path / "holdout.json"
+        payload.write_text('{"brier": 0.12}', encoding="utf-8")
+        assert _holdout_governor_from_env(env={"DELPHI_HOLDOUT_FILE": str(payload)}) is None
+        assert _holdout_governor_from_env(env={"DELPHI_HOLDOUT_BUDGET": "3"}) is None
+
+    def test_configured_builds_budgeted_logged_governor(self, tmp_path) -> None:
+        from common.cli import _holdout_governor_from_env
+
+        payload = tmp_path / "holdout.json"
+        payload.write_text('{"brier": 0.12}', encoding="utf-8")
+        governor = _holdout_governor_from_env(
+            env={"DELPHI_HOLDOUT_FILE": str(payload), "DELPHI_HOLDOUT_BUDGET": "2"}
+        )
+        assert governor is not None
+        assert governor.remaining_budget() == 2
+        view = governor.access_holdout(reason="wiring test")
+        assert view.payload == {"brier": 0.12}
+        assert governor.remaining_budget() == 1
+        assert governor.verify_chain().ok
+
+    def test_non_integer_budget_raises(self, tmp_path) -> None:
+        from common.cli import _holdout_governor_from_env
+
+        payload = tmp_path / "holdout.json"
+        payload.write_text("{}", encoding="utf-8")
+        with pytest.raises(ValueError, match="must be an integer"):
+            _holdout_governor_from_env(
+                env={"DELPHI_HOLDOUT_FILE": str(payload), "DELPHI_HOLDOUT_BUDGET": "many"}
+            )
+
+    def test_non_object_payload_raises(self, tmp_path) -> None:
+        from common.cli import _holdout_governor_from_env
+
+        payload = tmp_path / "holdout.json"
+        payload.write_text("[1, 2, 3]", encoding="utf-8")
+        with pytest.raises(ValueError, match="JSON object"):
+            _holdout_governor_from_env(
+                env={"DELPHI_HOLDOUT_FILE": str(payload), "DELPHI_HOLDOUT_BUDGET": "1"}
+            )
+
+
+class TestServeAuthWarning:
+    def _service(self):
+        from api.routes import ForecastService
+        from conductor.heuristic import HeuristicConductor
+
+        store = InMemoryRegistryStore()
+        forecaster = _forecaster(store)
+        return ForecastService(
+            forecaster=forecaster,
+            conductor=HeuristicConductor(forecaster=forecaster),
+            store=store,
+        )
+
+    def test_warns_when_endpoint_is_open(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from api.server import DelphiApp
+
+        app = DelphiApp(self._service())
+        assert app.auth_enabled is False
+        code = main(["serve", "--check"], api_app=app)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "UNAUTHENTICATED" in out
+
+    def test_silent_when_token_configured(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from api.server import DelphiApp
+
+        app = DelphiApp(self._service(), auth_token="secret-token")
+        assert app.auth_enabled is True
+        code = main(["serve", "--check"], api_app=app)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "UNAUTHENTICATED" not in out

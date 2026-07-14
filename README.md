@@ -96,6 +96,10 @@ uv run delphi conductor "Will SpaceX reach orbit with Starship before 2027?" --a
 
 Serve the OpenAI-compatible API and call it:
 
+> **Auth note:** without `DELPHI_SECRET_API_TOKEN` set, `delphi serve` runs an
+> **unauthenticated** endpoint — fine on localhost, never expose it publicly.
+> The production entry point (`api/wsgi.py`) refuses to start without the token.
+
 ```bash
 uv run delphi serve --check          # health round-trip, no socket bound
 uv run delphi serve --host 127.0.0.1 --port 8080   # bind and serve
@@ -239,6 +243,37 @@ artifacts to the S3 artifacts bucket for reproducible eval reruns. Terraform for
 the core stack lives in [`deploy/aws/`](deploy/aws/). The retrospective eval and
 live loop themselves are wired for Metaculus and ForecastBench (see
 [Benchmarking](#benchmarking-metaculus--forecastbench)).
+
+---
+
+## Roadmap (honest gaps)
+
+Built and tested but **not yet wired into the production forecast path** — the
+docs in `core/` describe the machinery; this list is what actually consumes it
+today:
+
+- **Memory recall** (`core/memory/`): the pgvector index and recall API are
+  complete and tested, but the forecast chain does not yet ask "have I forecast
+  something like this before?". Wiring it into `forecaster/`/`conductor/` is
+  planned.
+- **Bitemporal PIT store as the single evidence read path** (`core/pit/`): live
+  forecasts currently enforce as-of discipline through the snapshot-based
+  filter in `sources/` (equally strict, leakage-tested); unifying both paths
+  through the `core/pit/` facade is planned.
+- **Fitted recalibrator**: production forecasts run through log-odds
+  extremization but an identity recalibrator (provenance records
+  `"recalibrator": "identity"`). Shipping a fitted artifact from the
+  calibration split, loaded at composition time, is planned.
+- **API rate limiting**: the published endpoint has bearer-token auth but no
+  per-caller throttling; put a reverse proxy in front for production use.
+- **Learned conductor** (`conductor/learned/`): deliberate scaffolding — the
+  training loop interface, reward shaping (proper-score improvement), and
+  holdout-gated rollout exist; the RL trainer is a protocol with a
+  deterministic stand-in. See CLAUDE.md §4 (Stage 2 is upside, not a
+  dependency).
+- **CI Postgres service**: Postgres-marked integration tests skip in CI; adding
+  a pgvector service container would lift `core/pit/` and `core/registry/`
+  coverage toward their 100% target.
 
 ---
 

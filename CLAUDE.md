@@ -93,11 +93,13 @@ The two things that will silently destroy this product are **leakage** and
      merge. A red suite blocks merge. **Never** delete, skip, `xfail`, weaken, or comment out
      a test to make CI green — fix the code or surface the failure (see §11). Making a test
      pass by weakening it is a §2.2-class offense.
-   - **Coverage floor.** Maintain ≥90% line-and-branch coverage repo-wide, and **100% on the
-     correctness-critical modules**: `core/pit/` (as-of facade), `core/forecast/` (aggregation,
-     calibration, leakage judge), `core/registry/`, and `evaluation/`. Coverage is a floor,
-     not a target — a covered line is not a tested behavior; assert on outputs, not just that
-     code ran.
+   - **Coverage floor.** CI enforces ≥90% line-and-branch coverage repo-wide and **100% on
+     `evaluation/`**. The other correctness-critical modules — `core/pit/` (as-of facade),
+     `core/forecast/` (aggregation, calibration, leakage judge), `core/registry/` — are
+     ratcheting toward 100%: never let them regress, and close their gaps when touching them
+     (much of the remainder is Postgres-marked paths that skip without a database). Coverage
+     is a floor, not a target — a covered line is not a tested behavior; assert on outputs,
+     not just that code ran.
    - **Determinism.** Tests are deterministic and hermetic: seed all randomness, freeze the
      as-of clock, and **mock every network/LLM/provider call** (no live API calls in unit
      tests). A flaky test is a failing test.
@@ -188,7 +190,8 @@ the machinery whose correctness the whole system depends on:
   agentic_search, leakage_judge.
 - `core/registry/` — immutable questions / forecasts / evidence / resolutions.
 - `core/memory/` — forecast & experiment recall (pgvector): "have I forecast something like
-  this, and how did it resolve?"
+  this, and how did it resolve?" (built + tested; not yet consumed by the forecast chain —
+  see the README roadmap)
 - `core/agents/` — agent template + role contracts.
 - `core/orchestration/` — loops, schedulers, the conductor interface.
 

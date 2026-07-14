@@ -145,7 +145,8 @@ The Bayesian path is the intended long-term formation method. The legacy path re
 | [`forecast/calibration.py`](calibration.py) | Downstream: extremizes aggregated posterior (not rebuilt) |
 | Application-layer base-rate store | Prior source: PIT base rates (consumed, not imported by core) |
 | Application-layer forecaster | **Not yet wired** to Bayesian path |
-| `tests/forecast/test_bayesian.py` | Acceptance suite BA1–BA8 + §8 unit tests |
+| `tests/forecast/test_bedrock_likelihood_llm.py` | Production likelihood-LLM tests (log-LR draws, prior in prompt, malformed / absolute-probability rejection) |
+| `tests/forecast/test_ensemble_core.py` | Aggregation + spread behavior reused over posterior probabilities |
 | [`forecast/__init__.py`](__init__.py) | Public exports |
 
 ### Public API surface
@@ -540,7 +541,7 @@ evidence_text = assemble_evidence_bundle(question, as_of=forecast_as_of)
 from core.forecast import elicit_and_build_bayesian_ensemble
 
 result = elicit_and_build_bayesian_ensemble(
-    llm,  # production EvidenceLikelihoodLLM — not yet built
+    llm,  # e.g. BedrockEvidenceLikelihoodLLM (core/forecast/bayesian.py)
     content=evidence_text,
     content_hash=doc.content_hash,
     base_rate=pit_rate,
@@ -571,20 +572,26 @@ uncertainty = quantify_from_ensemble(calibrated)  # via adapter
 
 ## 12. Testing: acceptance suite BA1–BA8
 
-Run: `uv run pytest tests/forecast/test_bayesian.py`
+Run: `uv run pytest tests/forecast/test_bedrock_likelihood_llm.py tests/forecast/test_ensemble_core.py`
 
-| Test | Class | What it proves |
-|------|-------|----------------|
-| **BA1** | `TestBA1PriorIsBaseRate` | Prior = PIT base rate; future-resolved outcomes don't change past prior |
-| **BA2** | `TestBA2LikelihoodElicitation` | Log-LR elicitation only; no absolute-probability field or API |
-| **BA3** | `TestBA3Combination` | `posterior_logodds = prior_logodds + evidence_log_lr`; neutral/supportive behavior |
-| **BA4** | `TestBA4Auditability` | Prior, evidence-LR, posterior recorded on `Posterior` and draws |
-| **BA5** | `TestBA5Stability` | Log-LR path lower variance and MSE than absolute-p on noise fixture |
-| **BA6** | `TestBA6Pit` | Ensemble carries `knowledge_time`; PIT prior produces correct posterior |
-| **BA7** | `TestBA7Ordering` | `calibrate_ensemble` operates on aggregated posterior, not raw prior |
-| **BA8** | `TestBA8Determinism` | Same inputs → same outputs with fixture LLM |
+BA1–BA8 below are the **acceptance criteria** for the Bayesian formation layer.
+There is no dedicated `TestBA*` suite yet: related coverage lives in
+`tests/forecast/test_bedrock_likelihood_llm.py` (log-LR-only elicitation; an
+absolute-probability payload is rejected), `tests/forecaster/test_inside_view.py`
+(the fixture likelihood LLM in the inside-view stage), and
+`tests/forecast/test_calibration.py` (extremization behavior). Criteria without
+a dedicated test are marked open.
 
-Additional §8 unit tests cover happy path, boundary cases (near-zero prior, neutral evidence), and failure modes (invalid base rate, NaN log-LR, empty draws).
+| Test | Status | What it proves |
+|------|--------|----------------|
+| **BA1** | open | Prior = PIT base rate; future-resolved outcomes don't change past prior |
+| **BA2** | covered | Log-LR elicitation only; no absolute-probability field or API |
+| **BA3** | open | `posterior_logodds = prior_logodds + evidence_log_lr`; neutral/supportive behavior |
+| **BA4** | open | Prior, evidence-LR, posterior recorded on `Posterior` and draws |
+| **BA5** | open | Log-LR path lower variance and MSE than absolute-p on noise fixture |
+| **BA6** | open | Ensemble carries `knowledge_time`; PIT prior produces correct posterior |
+| **BA7** | open | `calibrate_ensemble` operates on aggregated posterior, not raw prior |
+| **BA8** | open | Same inputs → same outputs with fixture LLM |
 
 **Current status:** 31 tests, all passing. Full suite: 809 passed.
 
@@ -596,15 +603,18 @@ These items are **outside prompt 24's scope** but required to make Bayesian form
 
 ### 13.1 Production `EvidenceLikelihoodLLM` implementation
 
-**Status:** Not built. Only `FixtureEvidenceLikelihoodLLM` exists.
+**Status:** Built. `BedrockEvidenceLikelihoodLLM` (`core/forecast/bayesian.py`)
+implements `EvidenceLikelihoodLLM` over the tiered structured client, injects the
+prior into the elicitation prompt, validates the structured `evidence_log_lr`
+payload (rejecting non-finite values and absolute-probability outputs), and pins
+`model_version` / `prompt_version`. Tested in
+`tests/forecast/test_bedrock_likelihood_llm.py`. (`FixtureEvidenceLikelihoodLLM`
+remains the hermetic test double.)
 
-**Needed:**
+**Still needed:**
 
-- Bedrock/Batch API adapter implementing `EvidenceLikelihoodLLM`
-- Elicitation prompt template with prior + as-of evidence
-- Structured JSON parsing for `evidence_log_lr`
 - Content-addressed caching (mirroring ensemble cache pattern from prompt 18)
-- Model version and prompt version pinning for reproducibility
+- Batch API integration for high-volume elicitation
 
 ### 13.2 Application-layer wiring
 

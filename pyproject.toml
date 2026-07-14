@@ -90,6 +90,10 @@ exclude = [".venv", "**/__pycache__"]
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "--import-mode=importlib"
+filterwarnings = [
+    # Fail loudly if the pydantic protected-namespace warning ever comes back.
+    "error:.*protected namespace.*:UserWarning",
+]
 markers = [
     "postgres: tests requiring a reachable PostgreSQL instance (DELPHI_PG_DSN)",
     "e2e: full-loop end-to-end tests (real Postgres, mocked LLM transport)",

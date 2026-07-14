@@ -583,17 +583,27 @@ assert forecast2.probability == forecast.probability
 assert llm.batch_call_count == 1  # still 1
 ```
 
-### Production workflow (not yet implemented — see §11)
+### Production workflow (wired — see `_default_forecaster()` in `common/cli.py`)
+
+The production `ForecastLLM` is `BedrockForecastLLM` (`core/forecast/llm.py`). It is
+composed into the application-layer pipeline forecaster (`forecaster/chain.py`) by
+`_default_forecaster()` in `common/cli.py`, which backs `delphi forecast` and the
+eval / conductor / live-benchmark commands:
 
 ```python
-# Pseudocode — production ForecastLLM not yet wired
-cache = PostgresEnsembleCache.connect(os.environ["DELPHI_PG_DSN"])
-llm = BedrockBatchForecastLLM(model="claude-haiku-…")  # TODO
-forecaster = Forecaster(llm, cache)
-
-for doc in pending_source_docs:
-    forecast = forecaster.ensemble_forecast(doc)
-    # forecast.probability → calibration (19) → uncertainty (23)
+# Abridged from _default_forecaster() in common/cli.py
+comp = build_postgres_composition()
+reasoning = comp.structured_client("opus")
+forecaster = Forecaster(  # forecaster/chain.py — the full §3 pipeline
+    intake=IntakeService(llm=reasoning, store=comp.registry_store),
+    searcher=comp.hosted_searcher(...),  # Tavily-backed as-of search + snapshot store
+    reasoning_llm=reasoning,
+    forecast_llm=BedrockForecastLLM(comp.structured_client("opus")),
+    supervisor_llm=BedrockSupervisorLLM(comp.structured_client("fable")),
+    leakage_judge=LeakageJudge(BedrockLeakageJudgeLLM(comp.structured_client("opus"))),
+    registry_store=comp.registry_store,
+)
+result = forecaster.forecast(question_text, as_of=as_of)  # writes a complete registry record
 ```
 
 ---
@@ -604,14 +614,14 @@ All tests use `FixtureForecastLLM` — no live LLM or network calls.
 
 | Test | File | What it proves |
 |------|------|----------------|
-| **EN1** Variance reduction | `test_ensemble.py` | Aggregate of N noisy draws is closer to planted truth than a single draw |
-| **EN2** Robust aggregation | `test_ensemble.py` | Injected outlier (0.99 among 0.5s) does not move median; no LLM combiner |
-| **EN3** Uncertainty | `test_ensemble.py` | High-disagreement fixture yields wide std; consensus yields narrow; std is first-class field |
-| **EN4** Reproducibility | `test_ensemble.py` | Identical inputs return cached ensemble (batch_call_count unchanged); config change = new entry |
-| **EN5** PIT preserved | `test_ensemble.py` | `knowledge_time == doc.published_at`; per-run provenance records content_hash |
-| **EN6** Provenance | `test_ensemble.py` | Record carries all N run provenances + aggregation method |
-| **EN7** Determinism | `test_ensemble.py` | Same fixture LLM + doc → identical probability and uncertainty |
-| **EN8** Batching | `test_ensemble.py` | N=10 runs issued in exactly 1 batch call |
+| **EN1** Variance reduction | `tests/forecast/test_ensemble_core.py` | Aggregate of N noisy draws is closer to planted truth than a single draw |
+| **EN2** Robust aggregation | `tests/forecast/test_ensemble_core.py` | Injected outlier (0.99 among 0.5s) does not move median; no LLM combiner |
+| **EN3** Uncertainty | `tests/forecast/test_ensemble_core.py` | High-disagreement fixture yields wide std; consensus yields narrow; std is first-class field |
+| **EN4** Reproducibility | `tests/forecast/test_cache.py` | Identical inputs return cached ensemble (idempotent put/get); config change = new entry |
+| **EN5** PIT preserved | `tests/forecast/test_ensemble_core.py` | `knowledge_time == doc.published_at`; per-run provenance records content_hash |
+| **EN6** Provenance | `tests/forecast/test_fixture_llm.py` | Draws carry per-run provenance + aggregation method recorded on the forecast |
+| **EN7** Determinism | `tests/forecast/test_ensemble_core.py` | Same fixture LLM + doc → identical probability and uncertainty |
+| **EN8** Batching | `tests/forecast/test_fixture_llm.py` | Runs issued through a single batch call; empty batch returns empty |
 
 Additional §8 unit tests cover:
 
@@ -642,7 +652,7 @@ uv run pytest && uv run pyright && uv run ruff check .
 
 | Item | Status | Work required |
 |------|--------|---------------|
-| **`BedrockBatchForecastLLM`** | Not implemented | Concrete `ForecastLLM` that submits N requests to Anthropic Batch API (Haiku tier), polls for results, parses JSON `{"probability": float}`, returns N `ForecastDraw`s |
+| **`BedrockForecastLLM`** | **Implemented** — `core/forecast/llm.py` | Production `ForecastLLM` over the tiered structured client (Anthropic API / Bedrock); parses and validates JSON `{"probability": float}`, returns `ForecastDraw`s. Wired via `_default_forecaster()` in `common/cli.py`; tested in `tests/forecast/test_bedrock_forecast_llm.py`. (A dedicated Batch API submission path remains an optimization seam.) |
 | **Response parsing + validation** | Not implemented | JSON schema validation, malformed response rejection (mirror extraction's reject/flag pattern) |
 | **Retry / partial batch failure** | Not implemented | Handle Batch API job failures, timeouts, and partial result sets |
 | **Cost tracking** | Not implemented | Log token usage per batch job for experiment accounting |
@@ -661,14 +671,14 @@ The `_DEFAULT_FORECAST_PROMPT` is a minimal one-liner. Production needs a full p
 
 | Item | Status | Work required |
 |------|--------|---------------|
-| **Wire forecaster into orchestration loop** | Not implemented | Prompt 16 orchestrator should call the as-of searcher, render gathered evidence into a forecast document, and invoke `Forecaster` after ingestion |
-| **Registry logging** | Not implemented | Log ensemble forecasts to experiment registry with code hash, params, cache key |
-| **CLI entry point** | Not implemented | e.g. `delphi forecast ensemble --doc-id …` |
-| **Link extraction → forecast** | Not wired | Currently independent pipelines over `SourceDoc`. Orchestration should ingest → extract → forecast in sequence |
+| **Wire forecaster into orchestration loop** | **Done** | `forecaster/chain.py` chains intake → as-of search → base rate → decomposition → inside-view ensemble → supervisor reconcile → calibrate → leakage gate → registry write |
+| **Registry logging** | **Done** | Every accepted forecast writes a complete `(question, evidence_set, forecast)` registry record via `forecaster/chain.py` — no silent forecast path |
+| **CLI entry point** | **Done** | `delphi forecast "<question>" --as-of <ts>` (`common/cli.py`), plus `delphi conductor`, `delphi eval`, `delphi bench live` reusing the same forecaster |
+| **Link extraction → forecast** | **Done** | `forecaster/chain.py` runs intake → search → evidence rendering → forecast in one chain |
 | **PIT fact write for forecasts** | Not implemented | Optionally append `ForecastResult` results as PIT facts (new dataset e.g. `forecasts`) for downstream feature consumption |
-| **Wire calibration into orchestration** | Not implemented | After `Forecaster.ensemble_forecast()`, call `calibrate_ensemble()`. No application wrapper yet — callers use the domain-agnostic core directly |
-| **Registry logging for calibrated forecasts** | Not implemented | Log `CalibratedForecast` to experiment registry with code hash, alpha, diagnostic flags |
-| **Application-layer convenience wrapper** | Not implemented | Optional `Forecaster.calibrated_forecast(doc)` that chains ensemble + calibration in one call |
+| **Wire calibration into orchestration** | **Done** | `forecaster/chain.py` calls `calibrate_reconciled()` (`forecaster/stages/calibrate.py`) after supervisor reconciliation |
+| **Registry logging for calibrated forecasts** | **Done** | The `CalibratedForecast` is part of every registry record (`forecaster/record.py`) |
+| **Application-layer convenience wrapper** | **Done** | `Forecaster.forecast()` chains search → ensemble → reconcile → calibrate → leakage gate in one call |
 
 ### Calibration-specific setup (P1)
 
@@ -695,7 +705,7 @@ The `_DEFAULT_FORECAST_PROMPT` is a minimal one-liner. Production needs a full p
 
 ### Current limitations
 
-1. **Fixture-only LLM** — No production `ForecastLLM` implementation. `FixtureForecastLLM` is the only concrete class. Production Bedrock Batch client is an extension seam only.
+1. **Production LLM implemented** — `BedrockForecastLLM` (`core/forecast/llm.py`) is the production `ForecastLLM`, wired into the application forecaster via `_default_forecaster()` in `common/cli.py`. `FixtureForecastLLM` remains the deterministic test double for hermetic unit tests; a dedicated Batch API client for high-volume sweeps is still an open extension seam.
 
 2. **No Postgres ensemble cache tests** — `PostgresEnsembleCache` mirrors the extraction cache pattern but has no `@pytest.mark.postgres` test coverage yet.
 
@@ -737,7 +747,7 @@ The `_DEFAULT_FORECAST_PROMPT` is a minimal one-liner. Production needs a full p
 
 | Priority | Improvement | Rationale |
 |----------|-------------|-----------|
-| **P0** | Production `BedrockBatchForecastLLM` | Unblocks real ensemble forecasts at scale |
+| **P0** | ~~Production `ForecastLLM`~~ **Done** — `BedrockForecastLLM` (`core/forecast/llm.py`), wired via `common/cli.py` | Batch API submission for high-volume sweeps remains an optimization |
 | **P0** | Postgres integration tests for ensemble cache | Parity with extraction cache test coverage |
 | **P1** | PIT fact write for `ForecastResult` | Enables `as_of` queries and feature library consumption |
 | **P1** | Per-event forecasting (not per-document) | A single document may mention multiple events; forecast should target a specific extraction record |

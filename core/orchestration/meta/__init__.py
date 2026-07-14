@@ -1,16 +1,10 @@
 """Meta-layer governance primitives that are domain-agnostic.
 
-Only the boundary check, config, and holdout governor are shared. The productivity
-metrics, oversight, director, and their monitoring-coupled types are rebuilt in the
-app layer around forecasting (proper-score) semantics.
+Only the holdout governor is shared: every holdout access is logged,
+hash-chained, and budgeted (CLAUDE.md §2.2). Application-specific meta-layer
+concerns (productivity metrics, oversight, routing) live in the app layer.
 """
 
-from core.orchestration.meta.boundary import (
-    MetaBoundaryViolation,
-    find_meta_boundary_violations,
-    run_meta_boundary_check,
-)
-from core.orchestration.meta.config import MetaConfig, default_meta_config
 from core.orchestration.meta.holdout import (
     HoldoutAccessRecord,
     HoldoutBudgetExhausted,
@@ -30,10 +24,5 @@ __all__ = [
     "HoldoutSource",
     "HoldoutView",
     "InMemoryHoldoutGovernor",
-    "MetaBoundaryViolation",
-    "MetaConfig",
     "StaticHoldoutSource",
-    "default_meta_config",
-    "find_meta_boundary_violations",
-    "run_meta_boundary_check",
 ]
