@@ -425,7 +425,10 @@ def _default_forecaster() -> Forecaster:  # pragma: no cover - requires LLM API 
             gdelt_http = HttpClient(
                 config=HttpConfig(
                     user_agent=settings.http_user_agent or _EVIDENCE_USER_AGENT,
-                    min_interval_s=5.0,
+                    min_interval_s=6.0,
+                    # A 429 from GDELT means an IP cooldown: retrying deepens
+                    # it. One attempt; the composite skips the provider.
+                    max_retries=1,
                 )
             )
             searchers.append(GdeltAsOfSearcher(http=gdelt_http, snapshot_store=snapshot_store))

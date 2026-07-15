@@ -140,3 +140,15 @@ def test_without_likelihood_llm_absolute_path_unchanged() -> None:
     result = _build(store=store).forecast("Will the team win the cup?", as_of=AS_OF)
     forecast = store.get_forecast(result.forecast_id)  # type: ignore[arg-type]
     assert forecast.trace["ensemble"]["n_runs"] == 4  # 4 method-agents x 1 run
+
+
+def test_build_evidence_query_prefers_entities_and_horizon() -> None:
+    from forecaster.chain import build_evidence_query
+
+    assert (
+        build_evidence_query("Will X?", ("Brent crude", "futures"), "before June 2026")
+        == "Brent crude futures before June 2026"
+    )
+    assert build_evidence_query("Will X?", (), None) == "Will X?"
+    assert build_evidence_query("Will X?", ("  ", ""), "h") == "Will X?"
+    assert build_evidence_query("Will X?", ("A",), None) == "A"

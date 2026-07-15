@@ -65,6 +65,23 @@ class ForecastResult:
     refusal: RefusalDecision | None
 
 
+def build_evidence_query(text: str, entities: Sequence[str], horizon: str | None) -> str:
+    """Compact evidence-search query: named entities + horizon when available.
+
+    Full question sentences retrieve poorly from keyword-oriented providers
+    (Wikipedia search, GDELT); the entities extracted at intake retrieve well
+    across every provider. Falls back to the canonical text when intake found
+    no entities.
+    """
+    names = [e.strip() for e in entities if e.strip()]
+    if not names:
+        return text
+    parts = [*names]
+    if horizon and horizon.strip():
+        parts.append(horizon.strip())
+    return " ".join(parts)
+
+
 class Forecaster:
     """The fixed-pipeline forecaster (CLAUDE.md §3)."""
 
@@ -145,7 +162,11 @@ class Forecaster:
             )
 
         question_id = outcome.question_id
-        query = outcome.resolvable.text
+        query = build_evidence_query(
+            outcome.resolvable.text,
+            outcome.resolvable.entities,
+            outcome.classification.horizon,
+        )
         evidence = self._gather_evidence(query, ceiling)
 
         base_rate = estimate_base_rate(query, evidence, llm=self._reasoning_llm, as_of=ceiling)
