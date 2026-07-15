@@ -1,0 +1,3 @@
+2026-07-14 22:16:22 [warning  ] eval_question_skipped          error='model output is not valid JSON: \'{\\n  "canonical_text": "Will the effective yield of BB-rated securities within the ICE BofA US High Yield Master II Index be higher on {resolution_date} than its value on {forecast_due_date}?",\\n  "doma\'' question_id=forecastbench:fred-BAMLH0A1HYBBEY
+2026-07-14 22:44:58 [warning  ] eval_question_skipped          error="anthropic declined the request (safety refusal, category='bio')" question_id=forecastbench:wikipedia-1084c41175ae9f0235e8eebfce488d810a43c3d46a0274aca6a4a0a3231c5a7a
+2026-07-15 00:13:39 [info     ] leakage_rate_estimated         aggregate_rate=0.0 flagged=0 slice_id= total=160
