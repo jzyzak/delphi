@@ -355,6 +355,11 @@ def _snapshot_store(snapshot_dir: str | None) -> Any:  # pragma: no cover - file
 
 _EVIDENCE_PROVIDERS = ("tavily", "gdelt", "wikipedia")
 
+# Wikimedia and GDELT both require polite clients: a descriptive User-Agent
+# (Wikimedia robot policy returns 403 without one) and modest pacing (GDELT's
+# keyless API 429s under bursts).
+_EVIDENCE_USER_AGENT = "DELPHI-forecaster/0.1 (+https://github.com/jzyzak/delphi)"
+
 
 def _evidence_provider_names(env: dict[str, str] | None = None) -> tuple[str, ...]:
     """Parse DELPHI_EVIDENCE_PROVIDERS (comma-separated; default: tavily).
@@ -417,11 +422,23 @@ def _default_forecaster() -> Forecaster:  # pragma: no cover - requires LLM API 
         elif name == "gdelt":
             from sources.providers.gdelt import GdeltAsOfSearcher
 
-            searchers.append(GdeltAsOfSearcher(http=http, snapshot_store=snapshot_store))
+            gdelt_http = HttpClient(
+                config=HttpConfig(
+                    user_agent=settings.http_user_agent or _EVIDENCE_USER_AGENT,
+                    min_interval_s=5.0,
+                )
+            )
+            searchers.append(GdeltAsOfSearcher(http=gdelt_http, snapshot_store=snapshot_store))
         elif name == "wikipedia":
             from sources.providers.wikipedia import WikipediaAsOfSearcher
 
-            searchers.append(WikipediaAsOfSearcher(http=http, snapshot_store=snapshot_store))
+            wiki_http = HttpClient(
+                config=HttpConfig(
+                    user_agent=settings.http_user_agent or _EVIDENCE_USER_AGENT,
+                    min_interval_s=1.0,
+                )
+            )
+            searchers.append(WikipediaAsOfSearcher(http=wiki_http, snapshot_store=snapshot_store))
     if len(searchers) == 1:
         searcher = searchers[0]
     else:
