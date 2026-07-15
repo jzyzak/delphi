@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from core.forecast.bayesian import EvidenceLikelihoodLLM
 from core.forecast.calibration import CalibratedForecast
 from core.forecast.leakage_judge import LeakageJudge
 from core.forecast.llm import ForecastLLM
@@ -29,11 +30,12 @@ from forecaster.record import (
     build_forecast_input,
     build_rationale,
 )
-from forecaster.stages.aggregate import reconcile
+from forecaster.stages.aggregate import SupervisorTuning, reconcile
 from forecaster.stages.base_rate import estimate_base_rate
 from forecaster.stages.calibrate import Recalibrator, calibrate_reconciled
 from forecaster.stages.decompose import decompose_question
 from forecaster.stages.inside_view import (
+    assemble_bayesian_ensemble,
     assemble_ensemble,
     build_draw_requests,
     build_forecast_content,
@@ -79,6 +81,9 @@ class Forecaster:
         recalibrator: Recalibrator | None = None,
         aggregator: str = "median",
         runs_per_agent: int = 1,
+        evidence_likelihood_llm: EvidenceLikelihoodLLM | None = None,
+        bayesian_draws: int = 10,
+        supervisor_tuning: SupervisorTuning | None = None,
     ) -> None:
         self._intake = intake
         self._searcher = searcher
@@ -90,6 +95,9 @@ class Forecaster:
         self._recalibrator = recalibrator
         self._aggregator = aggregator
         self._runs_per_agent = runs_per_agent
+        self._likelihood_llm = evidence_likelihood_llm
+        self._bayesian_draws = bayesian_draws
+        self._supervisor_tuning = supervisor_tuning
 
     def _model_provenance(self) -> dict[str, object]:
         return {
@@ -143,15 +151,30 @@ class Forecaster:
         base_rate = estimate_base_rate(query, evidence, llm=self._reasoning_llm, as_of=ceiling)
         decomposition = decompose_question(query, llm=self._reasoning_llm)
         content = build_forecast_content(query, base_rate, decomposition, evidence)
-        requests = build_draw_requests(content=content, runs_per_agent=self._runs_per_agent)
-        ensemble = assemble_ensemble(
-            self._forecast_llm,
-            requests,
-            aggregator=self._aggregator,  # type: ignore[arg-type]
-            knowledge_time=ceiling,
-        )
+        if self._likelihood_llm is not None:
+            # Bayesian path (§3): prior = reference-class base rate; evidence
+            # log-LRs elicited per draw and combined in log-odds space.
+            ensemble = assemble_bayesian_ensemble(
+                self._likelihood_llm,
+                content=content,
+                base_rate=base_rate,
+                knowledge_time=ceiling,
+                n=self._bayesian_draws,
+                aggregator=self._aggregator,  # type: ignore[arg-type]
+            )
+        else:
+            requests = build_draw_requests(content=content, runs_per_agent=self._runs_per_agent)
+            ensemble = assemble_ensemble(
+                self._forecast_llm,
+                requests,
+                aggregator=self._aggregator,  # type: ignore[arg-type]
+                knowledge_time=ceiling,
+            )
         reconciled = reconcile(
-            ensemble, searcher=self._searcher, supervisor_llm=self._supervisor_llm
+            ensemble,
+            searcher=self._searcher,
+            supervisor_llm=self._supervisor_llm,
+            tuning=self._supervisor_tuning,
         )
         calibrated, uncertainty = calibrate_reconciled(reconciled, recalibrator=self._recalibrator)
         leakage = run_leakage_gate(ensemble, reconciled, judge=self._judge, forecast_id=question_id)

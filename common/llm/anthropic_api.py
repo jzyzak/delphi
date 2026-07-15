@@ -161,6 +161,13 @@ class AnthropicStructuredClient(StructuredClientBase):
             "temperature": self._config.temperature,
             "messages": [{"role": "user", "content": user}],
         }
+        if self._config.thinking == "adaptive":
+            # Adaptive-thinking models reject sampling parameters with a 400,
+            # so ``temperature`` gets the same treatment as ``top_p`` above.
+            kwargs["thinking"] = {"type": "adaptive"}
+            del kwargs["temperature"]
+        if self._config.effort is not None:
+            kwargs["output_config"] = {"effort": self._config.effort}
         if system:
             kwargs["system"] = system
         try:

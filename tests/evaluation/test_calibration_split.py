@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from evaluation.calibration_split import (
+    MIN_ISOTONIC_SAMPLES,
     CalibrationArtifact,
     IsotonicRecalibrator,
     assign_calibration_split,
@@ -14,6 +15,13 @@ from evaluation.calibration_split import (
 )
 from evaluation.scoring import ScoredRecord
 from forecaster.stages.calibrate import Recalibrator
+
+
+def _records(pairs: list[tuple[float, float]]) -> list[ScoredRecord]:
+    return [
+        ScoredRecord(question_id=f"q{i}", domain="d", probability=p, outcome=o)
+        for i, (p, o) in enumerate(pairs)
+    ]
 
 
 class TestSplitAssignment:
@@ -95,13 +103,24 @@ class TestExtremization:
         with pytest.raises(ValueError, match="grid"):
             fit_extremization_coefficient([0.5], [1.0], grid=())
 
+    def test_default_grid_reaches_below_old_minimum(self) -> None:
+        # Overconfident-wrong forecasts favor de-extremization; the widened
+        # default grid now reaches 0.25 (the old grid bottomed out at 0.5).
+        probs = [0.9, 0.1, 0.8, 0.2]
+        outcomes = [0.0, 1.0, 0.0, 1.0]
+        assert fit_extremization_coefficient(probs, outcomes) == 0.25
+
+    def test_default_grid_reaches_above_old_maximum(self) -> None:
+        # Mostly-correct confident forecasts with one miss have an interior
+        # log-loss minimum at 2.5 (the old grid capped at 2.0).
+        probs = [0.7] * 9
+        outcomes = [1.0] * 8 + [0.0]
+        assert fit_extremization_coefficient(probs, outcomes) == 2.5
+
 
 class TestArtifact:
     def test_fit_and_roundtrip(self) -> None:
-        records = [
-            ScoredRecord(question_id=f"q{i}", domain="d", probability=p, outcome=o)
-            for i, (p, o) in enumerate([(0.1, 0.0), (0.4, 0.0), (0.6, 1.0), (0.9, 1.0)])
-        ]
+        records = _records([(0.1, 0.0), (0.4, 0.0), (0.6, 1.0), (0.9, 1.0)])
         artifact = fit_calibration_artifact(records)
         restored = CalibrationArtifact.from_dict(artifact.to_dict())
         assert restored.alpha == pytest.approx(artifact.alpha)
@@ -110,3 +129,42 @@ class TestArtifact:
     def test_empty_raises(self) -> None:
         with pytest.raises(ValueError, match="empty split"):
             fit_calibration_artifact([])
+
+
+class TestMinSampleGuard:
+    def test_small_split_uses_identity_but_still_fits_alpha(self) -> None:
+        # 5 samples < MIN_ISOTONIC_SAMPLES: isotonic would overfit, so the
+        # recalibrator is the identity map — but alpha is still grid-fitted
+        # (confident-correct records push it to the grid maximum, 3.0).
+        records = _records([(0.8, 1.0), (0.7, 1.0), (0.3, 0.0), (0.2, 0.0), (0.9, 1.0)])
+        artifact = fit_calibration_artifact(records)
+        for p in (0.1, 0.25, 0.5, 0.73, 0.9):
+            assert artifact.recalibrator.apply(p) == pytest.approx(p)
+        assert artifact.recalibrator.provenance == {
+            "recalibrator": "identity",
+            "fitted": False,
+            "n": 0,
+        }
+        assert artifact.alpha == 3.0
+
+    def test_exactly_min_samples_fits_isotonic(self) -> None:
+        # At the MIN_ISOTONIC_SAMPLES boundary (20) the isotonic path is taken.
+        records = _records([(0.05 * (i + 1), 1.0 if i >= 10 else 0.0) for i in range(20)])
+        assert len(records) == MIN_ISOTONIC_SAMPLES
+        artifact = fit_calibration_artifact(records)
+        assert artifact.recalibrator.n == 20
+        assert artifact.recalibrator.provenance["recalibrator"] == "isotonic_pav"
+        assert artifact.recalibrator.provenance["fitted"] is True
+
+    def test_deterministic(self) -> None:
+        records = _records([(0.8, 1.0), (0.7, 1.0), (0.3, 0.0), (0.2, 0.0), (0.9, 1.0)])
+        assert fit_calibration_artifact(records) == fit_calibration_artifact(records)
+        large = _records([(0.05 * (i + 1), 1.0 if i >= 10 else 0.0) for i in range(20)])
+        assert fit_calibration_artifact(large) == fit_calibration_artifact(large)
+
+    def test_identity_artifact_roundtrips(self) -> None:
+        records = _records([(0.6, 1.0), (0.4, 0.0), (0.7, 1.0)])
+        artifact = fit_calibration_artifact(records)
+        restored = CalibrationArtifact.from_dict(artifact.to_dict())
+        assert restored.recalibrator.apply(0.42) == pytest.approx(0.42)
+        assert restored.alpha == pytest.approx(artifact.alpha)

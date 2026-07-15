@@ -20,6 +20,7 @@ from core.forecast.calibration import DEFAULT_ALPHA, calibrate
 from evaluation.scoring import ScoredRecord, log_score
 
 __all__ = [
+    "MIN_ISOTONIC_SAMPLES",
     "CalibrationArtifact",
     "IsotonicRecalibrator",
     "assign_calibration_split",
@@ -29,6 +30,11 @@ __all__ = [
 ]
 
 _EPS = 1e-6
+
+#: Below this many calibration samples, isotonic regression overfits/compresses;
+#: fit_calibration_artifact falls back to an identity recalibrator (the
+#: extremization alpha is still fitted on the available samples).
+MIN_ISOTONIC_SAMPLES = 20
 
 
 def assign_calibration_split(
@@ -102,6 +108,8 @@ class IsotonicRecalibrator:
 
     @property
     def provenance(self) -> dict[str, Any]:
+        if self.n == 0:
+            return {"recalibrator": "identity", "fitted": False, "n": 0}
         return {"recalibrator": "isotonic_pav", "fitted": True, "n": self.n}
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,9 +128,25 @@ def fit_extremization_coefficient(
     probabilities: Sequence[float],
     outcomes: Sequence[float],
     *,
-    grid: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0),
+    grid: Sequence[float] = (
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.25,
+        1.5,
+        1.75,
+        2.0,
+        2.25,
+        2.5,
+        2.75,
+        3.0,
+    ),
 ) -> float:
-    """Grid-search the extremization ``alpha`` minimizing mean log loss on the split."""
+    """Grid-search the extremization ``alpha`` minimizing mean log loss on the split.
+
+    Ties resolve to the first (lowest) grid value with the minimal loss.
+    """
     if not probabilities:
         msg = "cannot fit an extremization coefficient on an empty set."
         raise ValueError(msg)
@@ -160,14 +184,30 @@ class CalibrationArtifact:
         )
 
 
+def _identity_recalibrator() -> IsotonicRecalibrator:
+    """Identity map (``apply(p) == p``, edge-clamped); ``n=0`` marks it as unfitted."""
+    return IsotonicRecalibrator(x_thresholds=(0.0, 1.0), y_values=(0.0, 1.0), n=0)
+
+
 def fit_calibration_artifact(records: Sequence[ScoredRecord]) -> CalibrationArtifact:
-    """Fit the recalibrator + extremization coefficient on calibration records."""
+    """Fit the recalibrator + extremization coefficient on calibration records.
+
+    Below ``MIN_ISOTONIC_SAMPLES`` records, isotonic regression overfits (it
+    compresses toward the empirical outcomes), so the recalibrator falls back
+    to the identity map — the extremization alpha is still fitted on the
+    available samples. The path taken is recorded in the recalibrator's
+    ``provenance`` (``isotonic_pav`` vs ``identity``).
+    """
     if not records:
         msg = "cannot fit a calibration artifact on an empty split."
         raise ValueError(msg)
     probs = [r.probability for r in records]
     outcomes = [r.outcome for r in records]
+    if len(records) < MIN_ISOTONIC_SAMPLES:
+        recalibrator = _identity_recalibrator()
+    else:
+        recalibrator = fit_isotonic(probs, outcomes)
     return CalibrationArtifact(
-        recalibrator=fit_isotonic(probs, outcomes),
+        recalibrator=recalibrator,
         alpha=fit_extremization_coefficient(probs, outcomes),
     )

@@ -39,6 +39,14 @@ class Confidence(StrEnum):
     LOW = "low"
 
 
+_CONFIDENCE_RANK = {Confidence.LOW: 0, Confidence.MEDIUM: 1, Confidence.HIGH: 2}
+
+
+def _confidence_rank(confidence: Confidence) -> int:
+    """Total order over confidence levels (LOW < MEDIUM < HIGH)."""
+    return _CONFIDENCE_RANK[confidence]
+
+
 class DisagreementKind(StrEnum):
     """Why the supervisor invoked resolution search."""
 
@@ -518,6 +526,7 @@ class Supervisor:
         outlier_std_multiplier: float = DEFAULT_OUTLIER_STD_MULTIPLIER,
         multimodal_gap: float = DEFAULT_MULTIMODAL_GAP,
         min_cluster_size: int = DEFAULT_MIN_CLUSTER_SIZE,
+        min_apply_confidence: Confidence = Confidence.HIGH,
     ) -> None:
         self._search = search
         self._llm = llm
@@ -526,6 +535,7 @@ class Supervisor:
         self._outlier_std_multiplier = outlier_std_multiplier
         self._multimodal_gap = multimodal_gap
         self._min_cluster_size = min_cluster_size
+        self._min_apply_confidence = min_apply_confidence
         self.search_call_count = 0
 
     def reconcile(self, ensemble: EnsembleForecast) -> ReconciledForecast:
@@ -603,7 +613,7 @@ class Supervisor:
             "proposal": proposal.model_dump(mode="json"),
         }
 
-        if proposal.confidence != Confidence.HIGH:
+        if _confidence_rank(proposal.confidence) < _confidence_rank(self._min_apply_confidence):
             result = _fallback_forecast(
                 ensemble,
                 disagreement,

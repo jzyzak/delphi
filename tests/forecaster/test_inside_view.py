@@ -97,3 +97,19 @@ class TestBayesianEnsemble:
         # Neutral log-LR => posterior stays at the prior.
         assert ensemble.probability == pytest.approx(0.3, abs=1e-6)
         assert ensemble.n == 5
+
+
+def test_empty_evidence_content_instructs_against_hedging() -> None:
+    from forecaster.stages.base_rate import BaseRateEstimate
+    from forecaster.stages.decompose import Decomposition
+    from forecaster.stages.inside_view import build_forecast_content
+
+    content = build_forecast_content(
+        "Will X happen?",
+        BaseRateEstimate(prior=0.3, reference_class="events like X"),
+        Decomposition(sub_questions=(), rule="none"),
+        (),
+    )
+    assert "none retrieved" in content
+    assert "commit" in content.lower()
+    assert "0.5" in content  # explicit anti-hedge instruction

@@ -1,10 +1,19 @@
-"""Typed configuration for the LLM transport layer."""
+"""Typed configuration for the LLM transport layer.
+
+The ``thinking`` and ``effort`` fields are Anthropic-transport-only for now:
+the direct Anthropic API transport honors them; other transports (Bedrock)
+ignore them.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 __all__ = ["LLMConfig"]
+
+# Allowed values for the Anthropic-only knobs (None = feature off).
+_VALID_THINKING = frozenset({None, "adaptive"})
+_VALID_EFFORT = frozenset({None, "low", "medium", "high", "xhigh", "max"})
 
 
 @dataclass(frozen=True)
@@ -18,6 +27,11 @@ class LLMConfig:
 
     Retry backoff is parameterized so tests can drive it to zero (no real
     sleeps) while production uses exponential backoff.
+
+    ``thinking`` and ``effort`` are honored by the Anthropic transport only for
+    now (Bedrock ignores them). ``thinking="adaptive"`` enables adaptive
+    thinking (and drops sampling parameters, which adaptive-thinking models
+    reject); ``effort`` maps to the Messages API ``output_config.effort``.
     """
 
     temperature: float = 1.0
@@ -28,6 +42,8 @@ class LLMConfig:
     max_retries: int = 4
     retry_backoff_base: float = 0.5
     retry_backoff_max: float = 8.0
+    thinking: str | None = None
+    effort: str | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.temperature <= 2.0:
@@ -50,4 +66,11 @@ class LLMConfig:
             raise ValueError(msg)
         if self.retry_backoff_base < 0.0 or self.retry_backoff_max < 0.0:
             msg = "retry backoff parameters must be non-negative"
+            raise ValueError(msg)
+        if self.thinking not in _VALID_THINKING:
+            msg = f"thinking must be None or 'adaptive', got {self.thinking!r}"
+            raise ValueError(msg)
+        if self.effort not in _VALID_EFFORT:
+            allowed = sorted(v for v in _VALID_EFFORT if v is not None)
+            msg = f"effort must be None or one of {allowed}, got {self.effort!r}"
             raise ValueError(msg)

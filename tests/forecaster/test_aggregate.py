@@ -55,3 +55,48 @@ def test_low_confidence_falls_back() -> None:
     result = reconcile(ensemble, searcher=FixtureAsOfSearch(), supervisor_llm=supervisor)
     assert result.applied is False
     assert result.probability == pytest.approx(ensemble.probability)
+
+
+class TestSupervisorTuning:
+    def test_medium_confidence_applied_when_gate_relaxed(self) -> None:
+        from forecaster.stages.aggregate import SupervisorTuning, reconcile
+
+        ensemble = _ensemble([0.1, 0.1, 0.9, 0.9])  # multimodal disagreement
+        supervisor = FixtureSupervisorLLM(
+            {"multimodal": FixtureSupervisorResponse(probability=0.8, confidence=Confidence.MEDIUM)}
+        )
+        tuned = reconcile(
+            ensemble,
+            searcher=FixtureAsOfSearch(),
+            supervisor_llm=supervisor,
+            tuning=SupervisorTuning(min_apply_confidence=Confidence.MEDIUM),
+        )
+        assert tuned.applied is True
+        assert tuned.probability == 0.8
+
+    def test_medium_confidence_falls_back_at_default_gate(self) -> None:
+        from forecaster.stages.aggregate import reconcile
+
+        ensemble = _ensemble([0.1, 0.1, 0.9, 0.9])
+        supervisor = FixtureSupervisorLLM(
+            {"multimodal": FixtureSupervisorResponse(probability=0.8, confidence=Confidence.MEDIUM)}
+        )
+        result = reconcile(ensemble, searcher=FixtureAsOfSearch(), supervisor_llm=supervisor)
+        assert result.applied is False
+        assert result.probability == ensemble.probability
+
+    def test_spread_threshold_zero_triggers_on_small_spread(self) -> None:
+        from forecaster.stages.aggregate import SupervisorTuning, reconcile
+
+        ensemble = _ensemble([0.48, 0.5, 0.52])  # tiny spread; default never triggers
+        supervisor = FixtureSupervisorLLM(
+            default=FixtureSupervisorResponse(probability=0.7, confidence=Confidence.HIGH)
+        )
+        result = reconcile(
+            ensemble,
+            searcher=FixtureAsOfSearch(),
+            supervisor_llm=supervisor,
+            tuning=SupervisorTuning(spread_threshold=0.0),
+        )
+        assert supervisor.call_count == 1  # supervisor consulted despite tiny spread
+        assert result.applied is True

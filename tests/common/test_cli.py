@@ -621,3 +621,28 @@ class TestEvalWithLeakageAudit:
         out = capsys.readouterr().out
         assert code == 1
         assert "No leakage judge" in out
+
+
+class TestEvidenceProviderNames:
+    def test_default_is_tavily(self) -> None:
+        from common.cli import _evidence_provider_names
+
+        assert _evidence_provider_names(env={}) == ("tavily",)
+
+    def test_parses_ordered_unique(self) -> None:
+        from common.cli import _evidence_provider_names
+
+        env = {"DELPHI_EVIDENCE_PROVIDERS": "gdelt, wikipedia,tavily,gdelt"}
+        assert _evidence_provider_names(env=env) == ("gdelt", "wikipedia", "tavily")
+
+    def test_unknown_provider_raises(self) -> None:
+        from common.cli import _evidence_provider_names
+
+        with pytest.raises(ValueError, match="unknown evidence provider"):
+            _evidence_provider_names(env={"DELPHI_EVIDENCE_PROVIDERS": "bing"})
+
+    def test_only_commas_raises(self) -> None:
+        from common.cli import _evidence_provider_names
+
+        with pytest.raises(ValueError, match="at least one"):
+            _evidence_provider_names(env={"DELPHI_EVIDENCE_PROVIDERS": ", ,"})

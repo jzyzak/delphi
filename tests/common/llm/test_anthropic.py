@@ -131,6 +131,60 @@ class TestInvokeStructured:
         assert call["system"] == "sys"
         assert call["messages"] == [{"role": "user", "content": "usr"}]
 
+    def test_no_thinking_or_effort_by_default(self) -> None:
+        # Regression guard: with both knobs unset, the request keeps
+        # temperature and carries neither thinking nor output_config.
+        client, fake = _client(['{"x": 1}'])
+        client.invoke_structured(system="s", user="u")
+        call = fake.calls[0]
+        assert "temperature" in call
+        assert "thinking" not in call
+        assert "output_config" not in call
+
+    def test_adaptive_thinking_sets_param_and_omits_temperature(self) -> None:
+        client, fake = _client(['{"x": 1}'], thinking="adaptive")
+        client.invoke_structured(system="s", user="u")
+        call = fake.calls[0]
+        assert call["thinking"] == {"type": "adaptive"}
+        # Adaptive-thinking models reject sampling params (same as top_p).
+        assert "temperature" not in call
+        assert "top_p" not in call
+
+    def test_effort_sets_output_config(self) -> None:
+        client, fake = _client(['{"x": 1}'], effort="high")
+        client.invoke_structured(system="s", user="u")
+        call = fake.calls[0]
+        assert call["output_config"] == {"effort": "high"}
+        # effort alone does not disable sampling or enable thinking
+        assert "temperature" in call
+        assert "thinking" not in call
+
+    def test_thinking_and_effort_combine(self) -> None:
+        client, fake = _client(['{"x": 1}'], thinking="adaptive", effort="max")
+        client.invoke_structured(system="s", user="u")
+        call = fake.calls[0]
+        assert call["thinking"] == {"type": "adaptive"}
+        assert call["output_config"] == {"effort": "max"}
+        assert "temperature" not in call
+
+    def test_thinking_block_before_text_still_parses(self) -> None:
+        # A thinking-block dict followed by a text block: _extract_text must
+        # skip the thinking block and return the JSON-bearing text.
+        fake = FixedResponse(
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "let me reason about this..."},
+                    {"type": "text", "text": '{"probability": 0.55}'},
+                ]
+            }
+        )
+        client = AnthropicStructuredClient(
+            model_id="m",
+            client=fake,
+            config=LLMConfig(max_retries=1, thinking="adaptive", effort="high"),
+        )
+        assert client.invoke_structured(system="s", user="u") == {"probability": 0.55}
+
     def test_empty_system_omits_system_field(self) -> None:
         client, fake = _client(['{"x": 1}'])
         client.invoke_structured(system="", user="u")

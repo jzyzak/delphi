@@ -104,3 +104,39 @@ def test_replay_is_byte_identical() -> None:
     r2 = _build(store=InMemoryRegistryStore()).forecast("Will the team win?", as_of=AS_OF)
     assert r1.probability == r2.probability
     assert r1.rationale == r2.rationale
+
+
+def test_bayesian_path_uses_base_rate_prior_and_likelihood_llm() -> None:
+    from core.forecast.bayesian import FixtureEvidenceLikelihoodLLM
+
+    store = InMemoryRegistryStore()
+    intake = IntakeService(llm=FixtureStructuredLLM([_CLASSIFY, _NORMALIZE]), store=store)
+    forecaster = Forecaster(
+        intake=intake,
+        searcher=FixtureAsOfSearch(default=(_evidence(),)),
+        reasoning_llm=FixtureStructuredLLM([_BASE_RATE, _DECOMPOSE]),
+        forecast_llm=FixtureForecastLLM(default_response=0.6),
+        supervisor_llm=FixtureSupervisorLLM(),
+        leakage_judge=LeakageJudge(FixtureLeakageJudgeLLM()),
+        registry_store=store,
+        evidence_likelihood_llm=FixtureEvidenceLikelihoodLLM(default_response=1.0),
+        bayesian_draws=6,
+    )
+    result = forecaster.forecast("Will the team win the cup?", as_of=AS_OF)
+
+    assert result.accepted is True
+    assert result.probability is not None
+    # prior 0.4 (log-odds ~ -0.405) + log-LR 1.0 -> posterior sigmoid(0.595) ~ 0.64;
+    # the aggregate must sit above the prior (supportive evidence), not at 0.5.
+    forecast = store.get_forecast(result.forecast_id)  # type: ignore[arg-type]
+    assert forecast.trace["ensemble"]["n_runs"] == 6
+    # prior 0.4 + log-LR 1.0 -> posterior ~0.64; extremization pushes further up.
+    # The final probability must sit clearly above both 0.5 and the 0.4 prior.
+    assert result.probability > 0.55
+
+
+def test_without_likelihood_llm_absolute_path_unchanged() -> None:
+    store = InMemoryRegistryStore()
+    result = _build(store=store).forecast("Will the team win the cup?", as_of=AS_OF)
+    forecast = store.get_forecast(result.forecast_id)  # type: ignore[arg-type]
+    assert forecast.trace["ensemble"]["n_runs"] == 4  # 4 method-agents x 1 run

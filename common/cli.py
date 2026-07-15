@@ -353,34 +353,102 @@ def _snapshot_store(snapshot_dir: str | None) -> Any:  # pragma: no cover - file
     return FileSnapshotStore(root)
 
 
+_EVIDENCE_PROVIDERS = ("tavily", "gdelt", "wikipedia")
+
+
+def _evidence_provider_names(env: dict[str, str] | None = None) -> tuple[str, ...]:
+    """Parse DELPHI_EVIDENCE_PROVIDERS (comma-separated; default: tavily).
+
+    Order is preserved and duplicates removed; unknown names raise so a typo
+    cannot silently drop an evidence source.
+    """
+    import os
+
+    e = env if env is not None else dict(os.environ)
+    raw = e.get("DELPHI_EVIDENCE_PROVIDERS") or "tavily"
+    names: list[str] = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in _EVIDENCE_PROVIDERS:
+            valid = ", ".join(_EVIDENCE_PROVIDERS)
+            msg = f"unknown evidence provider {name!r}; choose from: {valid}."
+            raise ValueError(msg)
+        if name not in names:
+            names.append(name)
+    if not names:
+        msg = "DELPHI_EVIDENCE_PROVIDERS must name at least one provider."
+        raise ValueError(msg)
+    return tuple(names)
+
+
 def _default_forecaster() -> Forecaster:  # pragma: no cover - requires LLM API + hosted search
     from common.composition import build_postgres_composition
     from common.http.client import HttpClient
     from common.http.config import HttpConfig
+    from common.llm import LLMConfig
     from common.secrets import EnvSecretProvider
+    from core.forecast.bayesian import BedrockEvidenceLikelihoodLLM
     from core.forecast.leakage_judge import BedrockLeakageJudgeLLM, LeakageJudge
     from core.forecast.llm import BedrockForecastLLM
-    from core.forecast.supervisor import BedrockSupervisorLLM
+    from core.forecast.supervisor import BedrockSupervisorLLM, Confidence
+    from forecaster.stages.aggregate import SupervisorTuning
     from sources.providers.tavily import TavilySearchClient, tavily_config
 
     comp = build_postgres_composition()
     settings = comp.settings
-    reasoning = comp.structured_client("opus")
+    # Reasoning-grade config: adaptive thinking + high effort + headroom for
+    # the reasoning tokens (anthropic transport only; see common/llm/config.py).
+    reasoning_cfg = LLMConfig(thinking="adaptive", effort="high", max_tokens=4096)
+    reasoning = comp.structured_client("opus", config=reasoning_cfg)
     http = HttpClient(config=HttpConfig(user_agent=settings.http_user_agent))
-    tavily = TavilySearchClient(http=http, config=tavily_config(), secrets=EnvSecretProvider())
-    searcher = comp.hosted_searcher(
-        http_client=http,
-        client=tavily,
-        snapshot_store=_snapshot_store(settings.snapshot_dir),
-    )
+    snapshot_store = _snapshot_store(settings.snapshot_dir)
+    provider_names = _evidence_provider_names()
+    searchers = []
+    for name in provider_names:
+        if name == "tavily":
+            tavily = TavilySearchClient(
+                http=http, config=tavily_config(), secrets=EnvSecretProvider()
+            )
+            searchers.append(
+                comp.hosted_searcher(http_client=http, client=tavily, snapshot_store=snapshot_store)
+            )
+        elif name == "gdelt":
+            from sources.providers.gdelt import GdeltAsOfSearcher
+
+            searchers.append(GdeltAsOfSearcher(http=http, snapshot_store=snapshot_store))
+        elif name == "wikipedia":
+            from sources.providers.wikipedia import WikipediaAsOfSearcher
+
+            searchers.append(WikipediaAsOfSearcher(http=http, snapshot_store=snapshot_store))
+    if len(searchers) == 1:
+        searcher = searchers[0]
+    else:
+        from sources.searcher import CompositeAsOfSearcher
+
+        searcher = CompositeAsOfSearcher(searchers)
     return Forecaster(
         intake=IntakeService(llm=reasoning, store=comp.registry_store),
         searcher=searcher,
         reasoning_llm=reasoning,
-        forecast_llm=BedrockForecastLLM(comp.structured_client("opus")),
-        supervisor_llm=BedrockSupervisorLLM(comp.structured_client("fable")),
+        forecast_llm=BedrockForecastLLM(comp.structured_client("opus", config=reasoning_cfg)),
+        supervisor_llm=BedrockSupervisorLLM(comp.structured_client("fable", config=reasoning_cfg)),
         leakage_judge=LeakageJudge(BedrockLeakageJudgeLLM(comp.structured_client("opus"))),
         registry_store=comp.registry_store,
+        # Bayesian path: prior = reference-class base rate, per-draw evidence
+        # log-LRs combined in log-odds space (fights no-evidence 0.5 collapse).
+        evidence_likelihood_llm=BedrockEvidenceLikelihoodLLM(
+            comp.structured_client("opus", config=reasoning_cfg)
+        ),
+        bayesian_draws=12,
+        runs_per_agent=3,
+        aggregator="trimmed_mean",
+        # Looser trigger + MEDIUM apply gate: a 12-draw ensemble has meaningful
+        # spread, and the supervisor may improve on the aggregate more often.
+        supervisor_tuning=SupervisorTuning(
+            spread_threshold=0.08, min_apply_confidence=Confidence.MEDIUM
+        ),
     )
 
 

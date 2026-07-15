@@ -84,7 +84,13 @@ def build_forecast_content(
         for ev in evidence[:_MAX_EVIDENCE]:
             lines.append(f"  - [{ev.source_id}] {ev.snippet[:_SNIPPET_MAX]}")
     else:
-        lines.append("Evidence: none retrieved as of the ceiling.")
+        lines.append(
+            "Evidence: none retrieved as of the ceiling. Do NOT treat missing "
+            "retrieval as maximal uncertainty: anchor on the reference-class "
+            "base rate above and on what you already know from before the "
+            "as-of date, and commit to your best calibrated estimate rather "
+            "than defaulting toward 0.5."
+        )
     return "\n".join(lines)
 
 
