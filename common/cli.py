@@ -96,7 +96,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     eval_parser = sub.add_parser("eval", help="Proper scores + baselines + CIs + leakage audit.")
     eval_parser.add_argument("--suite", default="default", help="Benchmark suite name.")
-    eval_parser.add_argument(
+    eval_audit = eval_parser.add_mutually_exclusive_group()
+    eval_audit.add_argument(
+        "--with-leakage-audit",
+        dest="with_leakage_audit",
+        action="store_true",
+        help="Render the score report AND the leakage audit from the same run "
+        "(one forecasting pass; §2.6 leakage-first reporting).",
+    )
+    eval_audit.add_argument(
         "--leakage-audit",
         dest="leakage_audit",
         action="store_true",
@@ -299,13 +307,18 @@ def cmd_serve(args: argparse.Namespace, *, app: DelphiApp) -> int:
 
 def cmd_eval(args: argparse.Namespace, *, context: EvalContext) -> int:
     """Score a suite (or run a leakage audit) and print the report."""
+    judge = context.judge
+    if (args.leakage_audit or args.with_leakage_audit) and judge is None:
+        print("No leakage judge configured for this suite.")
+        return 1
     if args.leakage_audit:
-        if context.judge is None:
-            print("No leakage judge configured for this suite.")
-            return 1
-        print(render_leakage_audit(context.judge, context.inputs.traces))
+        assert judge is not None  # guarded above
+        print(render_leakage_audit(judge, context.inputs.traces))
         return 0
     print(render_report(context.inputs, harness=context.harness))
+    if args.with_leakage_audit:
+        assert judge is not None  # guarded above
+        print(render_leakage_audit(judge, context.inputs.traces))
     return 0
 
 
@@ -410,6 +423,70 @@ def _holdout_governor_from_env(
     return InMemoryHoldoutGovernor(budget=budget, source=StaticHoldoutSource(payload))
 
 
+def _eval_record_limits(
+    env: dict[str, str] | None = None,
+) -> tuple[str | None, int | None, int]:
+    """Read the retrospective-eval sampling knobs from the environment.
+
+    Returns ``(resolved_after, max_questions, max_pages)``. ``resolved_after``
+    (``DELPHI_EVAL_RESOLVED_AFTER``, ISO-8601) guards against scoring questions
+    the models may have memorized (§2.6: resolutions predating the model
+    training cutoff are suspect). ``max_questions``
+    (``DELPHI_EVAL_MAX_QUESTIONS``) bounds LLM spend. ``max_pages``
+    (``DELPHI_EVAL_MAX_PAGES``, metaculus only) controls fetch depth
+    (default 5).
+    """
+    import os
+
+    e = env if env is not None else dict(os.environ)
+    resolved_after = e.get("DELPHI_EVAL_RESOLVED_AFTER") or None
+    raw_max = e.get("DELPHI_EVAL_MAX_QUESTIONS")
+    raw_pages = e.get("DELPHI_EVAL_MAX_PAGES")
+    try:
+        max_questions = int(raw_max) if raw_max else None
+        max_pages = int(raw_pages) if raw_pages else 5
+    except ValueError as exc:
+        msg = "DELPHI_EVAL_MAX_QUESTIONS / DELPHI_EVAL_MAX_PAGES must be integers."
+        raise ValueError(msg) from exc
+    return resolved_after, max_questions, max_pages
+
+
+def _filter_eval_records(
+    records: Sequence[dict[str, Any]],
+    *,
+    resolved_after: str | None,
+    max_questions: int | None,
+) -> list[dict[str, Any]]:
+    """Bound a retrospective eval's question set before any forecasting spend.
+
+    ``resolved_after`` keeps only records whose ``resolved_at`` is strictly
+    later than the cutoff (records with no ``resolved_at`` are dropped — they
+    cannot be scored). ``max_questions`` keeps the freshest N by
+    ``resolved_at`` descending (deterministic: freshest first, ties broken by
+    the fetch order being stable under ``list.sort``).
+    """
+    from benchmarks.base import parse_dt
+
+    out = list(records)
+    if resolved_after is not None:
+        cutoff = parse_dt(resolved_after)
+        out = [
+            record
+            for record in out
+            if record.get("resolved_at") is not None and parse_dt(record["resolved_at"]) > cutoff
+        ]
+    if max_questions is not None:
+        floor = datetime.min.replace(tzinfo=UTC)
+
+        def freshness(record: dict[str, Any]) -> datetime:
+            raw = record.get("resolved_at")
+            return parse_dt(raw) if raw is not None else floor
+
+        out.sort(key=freshness, reverse=True)
+        out = out[:max_questions]
+    return out
+
+
 def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - network + LLM + DB
     """Wire a retrospective evaluation suite (fetch -> adapter -> forecast -> score).
 
@@ -438,10 +515,14 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
     forecast_fn = forecaster_fn(_default_forecaster())
 
     baselines: list[Baseline] = []
+    resolved_after, max_questions, max_pages = _eval_record_limits()
     if suite == "metaculus":
         records = MetaculusFetcher(http=http, secrets=EnvSecretProvider()).fetch(
             params={"statuses": "resolved", "forecast_type": "binary", "limit": 100},
-            max_pages=5,
+            max_pages=max_pages,
+        )
+        records = _filter_eval_records(
+            records, resolved_after=resolved_after, max_questions=max_questions
         )
         adapter: BenchmarkAdapter = MetaculusAdapter.from_records(records)
         baselines.append(consensus_baseline(adapter, price_key="community_prediction"))
@@ -450,6 +531,9 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
         resolution_set = os.environ.get("DELPHI_FORECASTBENCH_RESOLUTION_SET")
         records = ForecastBenchFetcher(http=http).fetch(
             question_set=question_set, resolution_set=resolution_set
+        )
+        records = _filter_eval_records(
+            records, resolved_after=resolved_after, max_questions=max_questions
         )
         adapter = ForecastBenchAdapter.from_records(records)
         baselines.append(records_baseline(records, source="forecastbench"))

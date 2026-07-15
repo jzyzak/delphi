@@ -497,3 +497,127 @@ class TestServeAuthWarning:
         out = capsys.readouterr().out
         assert code == 0
         assert "UNAUTHENTICATED" not in out
+
+
+class TestEvalRecordLimits:
+    def test_defaults_when_unset(self) -> None:
+        from common.cli import _eval_record_limits
+
+        assert _eval_record_limits(env={}) == (None, None, 5)
+
+    def test_reads_all_three_knobs(self) -> None:
+        from common.cli import _eval_record_limits
+
+        resolved_after, max_questions, max_pages = _eval_record_limits(
+            env={
+                "DELPHI_EVAL_RESOLVED_AFTER": "2026-02-01",
+                "DELPHI_EVAL_MAX_QUESTIONS": "250",
+                "DELPHI_EVAL_MAX_PAGES": "10",
+            }
+        )
+        assert resolved_after == "2026-02-01"
+        assert max_questions == 250
+        assert max_pages == 10
+
+    def test_empty_strings_fall_back(self) -> None:
+        from common.cli import _eval_record_limits
+
+        assert _eval_record_limits(
+            env={"DELPHI_EVAL_RESOLVED_AFTER": "", "DELPHI_EVAL_MAX_QUESTIONS": ""}
+        ) == (None, None, 5)
+
+    def test_non_integer_raises(self) -> None:
+        from common.cli import _eval_record_limits
+
+        with pytest.raises(ValueError, match="must be integers"):
+            _eval_record_limits(env={"DELPHI_EVAL_MAX_QUESTIONS": "many"})
+
+
+class TestFilterEvalRecords:
+    _RECORDS = [
+        {"id": "old", "resolved_at": "2025-06-01T00:00:00Z"},
+        {"id": "fresh", "resolved_at": "2026-06-01T00:00:00Z"},
+        {"id": "mid", "resolved_at": "2026-03-01T00:00:00Z"},
+        {"id": "unresolved"},
+    ]
+
+    def test_no_knobs_is_identity(self) -> None:
+        from common.cli import _filter_eval_records
+
+        out = _filter_eval_records(self._RECORDS, resolved_after=None, max_questions=None)
+        assert out == self._RECORDS
+
+    def test_resolved_after_drops_old_and_unresolved(self) -> None:
+        from common.cli import _filter_eval_records
+
+        out = _filter_eval_records(self._RECORDS, resolved_after="2026-02-01", max_questions=None)
+        assert [r["id"] for r in out] == ["fresh", "mid"]
+
+    def test_cutoff_is_strict(self) -> None:
+        from common.cli import _filter_eval_records
+
+        out = _filter_eval_records(
+            [{"id": "at", "resolved_at": "2026-02-01T00:00:00Z"}],
+            resolved_after="2026-02-01",
+            max_questions=None,
+        )
+        assert out == []
+
+    def test_max_questions_keeps_freshest_first(self) -> None:
+        from common.cli import _filter_eval_records
+
+        out = _filter_eval_records(self._RECORDS, resolved_after=None, max_questions=2)
+        assert [r["id"] for r in out] == ["fresh", "mid"]
+
+    def test_unresolved_sorts_last_under_cap(self) -> None:
+        from common.cli import _filter_eval_records
+
+        out = _filter_eval_records(self._RECORDS, resolved_after=None, max_questions=4)
+        assert [r["id"] for r in out] == ["fresh", "mid", "old", "unresolved"]
+
+    def test_filter_then_cap_compose(self) -> None:
+        from common.cli import _filter_eval_records
+
+        out = _filter_eval_records(self._RECORDS, resolved_after="2026-01-01", max_questions=1)
+        assert [r["id"] for r in out] == ["fresh"]
+
+    def test_does_not_mutate_input(self) -> None:
+        from common.cli import _filter_eval_records
+
+        snapshot = [dict(r) for r in self._RECORDS]
+        _filter_eval_records(self._RECORDS, resolved_after=None, max_questions=1)
+        assert snapshot == self._RECORDS
+
+
+class TestEvalWithLeakageAudit:
+    def test_flags_are_mutually_exclusive(self) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["eval", "--leakage-audit", "--with-leakage-audit"])
+
+    def test_with_audit_renders_report_and_audit(self, capsys: pytest.CaptureFixture[str]) -> None:
+        code = main(
+            ["eval", "--with-leakage-audit"],
+            eval_context=_eval_context(),  # type: ignore[arg-type]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Proper scores" in out
+        assert "leakage_rate" in out
+
+    def test_with_audit_requires_judge(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from core.orchestration.budget import InMemoryBudgetLedger
+        from evaluation.harness import EvalHarness
+        from evaluation.report import EvalContext, EvalInputs
+        from evaluation.scoring import ScoredRecord
+
+        ctx = EvalContext(
+            inputs=EvalInputs(
+                records=(ScoredRecord(question_id="q1", domain="d", probability=0.5, outcome=1.0),)
+            ),
+            harness=EvalHarness(budget_ledger=InMemoryBudgetLedger(cap=10, trials_count=lambda: 0)),
+            judge=None,
+        )
+        code = main(["eval", "--with-leakage-audit"], eval_context=ctx)
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "No leakage judge" in out
