@@ -288,3 +288,54 @@ class TestApiKeyResolution:
         client = AnthropicStructuredClient(model_id="m", api_key="k")
         with pytest.raises(RuntimeError, match="anthropic is required"):
             client.invoke_structured(system="s", user="u")
+
+
+class CountingRefusalMessages:
+    """Always returns a safety-refusal response and counts calls."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create(self, **_kwargs: Any) -> Any:
+        self.calls += 1
+        return {
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"category": "bio"},
+        }
+
+
+class TestRefusal:
+    def test_refusal_raises_typed_error_and_is_not_retried(self) -> None:
+        from common.llm import LLMRefusedError
+
+        fake = CountingRefusalMessages()
+        config = LLMConfig(retry_backoff_base=0.0, retry_backoff_max=0.0)
+        client = AnthropicStructuredClient(model_id="model-x", client=fake, config=config)
+        with pytest.raises(LLMRefusedError, match="category='bio'"):
+            client.invoke_structured(system="s", user="u")
+        assert fake.calls == 1  # a refusal must never be retried
+
+    def test_sdk_shaped_refusal_detected(self) -> None:
+        from common.llm import LLMRefusedError
+
+        details = types.SimpleNamespace(category="cyber")
+        response = types.SimpleNamespace(content=[], stop_reason="refusal", stop_details=details)
+        client = AnthropicStructuredClient(
+            model_id="model-x",
+            client=FixedResponse(response),
+            config=LLMConfig(retry_backoff_base=0.0, retry_backoff_max=0.0),
+        )
+        with pytest.raises(LLMRefusedError, match="cyber"):
+            client.invoke_structured(system="s", user="u")
+
+    def test_refusal_without_details_still_typed(self) -> None:
+        from common.llm import LLMRefusedError
+
+        client = AnthropicStructuredClient(
+            model_id="model-x",
+            client=FixedResponse({"content": [], "stop_reason": "refusal"}),
+            config=LLMConfig(retry_backoff_base=0.0, retry_backoff_max=0.0),
+        )
+        with pytest.raises(LLMRefusedError, match="category=None"):
+            client.invoke_structured(system="s", user="u")

@@ -20,7 +20,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+import structlog
+
 from benchmarks.base import BenchmarkAdapter, scored_records
+from common.llm.errors import LLMError
 from core.forecast.calibration import DEFAULT_ALPHA, calibrate
 from core.forecast.leakage_judge import LeakageJudge, Trace, TraceComponent
 from evaluation.baselines import MARKET_CONSENSUS, Baseline
@@ -166,15 +169,27 @@ def build_eval_context(
         if r.resolved_value in (0.0, 1.0) and r.question_id in questions
     ]
 
+    logger = structlog.get_logger(__name__)
     raw: dict[str, float] = {}
     traces_by_id: dict[str, tuple[Trace, ...]] = {}
+    errored: list[str] = []
     for qid in resolved_ids:
         question = questions[qid]
-        forecast = forecast_fn(question.text, question.as_of)
+        try:
+            forecast = forecast_fn(question.text, question.as_of)
+        except LLMError as exc:
+            # A single bad question (safety refusal, provider failure after
+            # retries) must not kill a multi-hour suite run. Treat it like a
+            # refusal: log, exclude from the scored set, keep going.
+            logger.warning("eval_question_skipped", question_id=qid, error=str(exc))
+            errored.append(qid)
+            continue
         if not forecast.accepted or forecast.raw_probability is None:
             continue  # refused questions do not enter the scored set.
         raw[qid] = forecast.raw_probability
         traces_by_id[qid] = forecast.traces
+    if errored:
+        logger.warning("eval_questions_skipped_total", count=len(errored))
 
     if not raw:
         msg = "no accepted forecasts to evaluate for this suite."

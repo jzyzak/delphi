@@ -20,6 +20,14 @@ class LLMThrottledError(LLMError):
     """
 
 
+class LLMRefusedError(LLMError):
+    """The provider's safety layer declined the request (stop_reason=refusal).
+
+    Deliberately NOT retryable: the same input will be declined again, so
+    retrying only burns budget. Callers treat it like a per-question refusal.
+    """
+
+
 class MalformedLLMOutput(LLMError):
     """Raised when provider output cannot be parsed into the expected structure.
 

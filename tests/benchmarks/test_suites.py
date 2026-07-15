@@ -199,3 +199,32 @@ class TestForecasterFn:
         out = fn("q", datetime(2026, 1, 1, tzinfo=UTC))
         assert out.accepted
         assert out.traces == ()
+
+
+class TestErroredQuestionSkipped:
+    def test_llm_error_on_one_question_does_not_kill_the_run(self) -> None:
+        from common.llm.errors import LLMRefusedError
+
+        adapter = _adapter(6)
+        poison = "Will event 3 happen?"
+
+        def _fn(text: str, _as_of: datetime) -> QuestionForecast:
+            if text == poison:
+                raise LLMRefusedError("safety refusal, category='bio'")
+            return QuestionForecast(accepted=True, raw_probability=0.6)
+
+        ctx = build_eval_context(adapter, _fn, harness=_harness(), calibration_fraction=0.5, seed=0)
+        scored_ids = {r.question_id for r in ctx.inputs.records}
+        assert scored_ids  # the run still produced a scored set
+        poison_id = next(q.question_id for q in adapter.questions() if q.text == poison)
+        assert poison_id not in scored_ids
+
+    def test_non_llm_errors_still_propagate(self) -> None:
+        adapter = _adapter(4)
+
+        def _fn(_text: str, _as_of: datetime) -> QuestionForecast:
+            msg = "programming bug"
+            raise TypeError(msg)
+
+        with pytest.raises(TypeError, match="programming bug"):
+            build_eval_context(adapter, _fn, harness=_harness())

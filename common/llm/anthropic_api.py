@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from common.llm.config import LLMConfig
-from common.llm.errors import LLMError, LLMThrottledError, MalformedLLMOutput
+from common.llm.errors import LLMError, LLMRefusedError, LLMThrottledError, MalformedLLMOutput
 from common.llm.structured import StructuredClientBase
 from common.secrets import EnvSecretProvider, SecretProvider
 
@@ -85,6 +85,18 @@ def _extract_text(response: Any) -> str:
     mappings, and skips non-text blocks (e.g. thinking blocks emitted by
     adaptive-thinking models) to find the JSON-bearing text.
     """
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason is None and isinstance(response, Mapping):
+        stop_reason = response.get("stop_reason")
+    if stop_reason == "refusal":
+        details = getattr(response, "stop_details", None)
+        if details is None and isinstance(response, Mapping):
+            details = response.get("stop_details")
+        category = getattr(details, "category", None)
+        if category is None and isinstance(details, Mapping):
+            category = details.get("category")
+        msg = f"anthropic declined the request (safety refusal, category={category!r})"
+        raise LLMRefusedError(msg)
     content = getattr(response, "content", None)
     if content is None and isinstance(response, Mapping):
         content = response.get("content")

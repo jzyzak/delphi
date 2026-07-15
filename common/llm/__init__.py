@@ -27,7 +27,7 @@ from common.llm.embedding import (
     BedrockEmbeddingClient,
     InvokeModelClient,
 )
-from common.llm.errors import LLMError, LLMThrottledError, MalformedLLMOutput
+from common.llm.errors import LLMError, LLMRefusedError, LLMThrottledError, MalformedLLMOutput
 from common.llm.structured import (
     StructuredClientBase,
     StructuredLLMClient,
@@ -48,6 +48,7 @@ __all__ = [
     "LLMConfig",
     "LLMError",
     "LLMThrottledError",
+    "LLMRefusedError",
     "MalformedLLMOutput",
     "MessagesClient",
     "StructuredClientBase",
