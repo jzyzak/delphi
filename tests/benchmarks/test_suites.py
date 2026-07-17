@@ -687,5 +687,3 @@ class TestForecasterFn:
         out = fn("q", datetime(2026, 1, 1, tzinfo=UTC))
         assert out.accepted
         assert out.traces == ()
-
-
