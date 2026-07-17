@@ -692,10 +692,15 @@ def _build_evidence_searchers(
             )
         elif name == "gdelt":
             from sources.providers.gdelt import GdeltAsOfSearcher
+            from sources.searcher import CircuitBreakerAsOfSearcher
 
             # A GDELT 429 is an IP cooldown: retrying deepens it, so single-
             # attempt with a 6s politeness interval; the composite skips it
-            # on failure rather than stalling the whole gather.
+            # on failure rather than stalling the whole gather. Once the
+            # cooldown is on, every further call fails for a long stretch
+            # (observed: hours of solid 429s), so a circuit breaker stops
+            # paying the interval+failure tax after 3 straight rate limits
+            # and probes again 15 minutes later.
             gdelt_http = HttpClient(
                 config=HttpConfig(
                     user_agent=settings.http_user_agent or _EVIDENCE_USER_AGENT,
@@ -703,7 +708,11 @@ def _build_evidence_searchers(
                     max_retries=1,
                 )
             )
-            searchers[name] = GdeltAsOfSearcher(http=gdelt_http, snapshot_store=snapshot_store)
+            searchers[name] = CircuitBreakerAsOfSearcher(
+                GdeltAsOfSearcher(http=gdelt_http, snapshot_store=snapshot_store),
+                failure_threshold=3,
+                cooldown_s=900.0,
+            )
         elif name == "wikipedia":
             from sources.providers.wikipedia import WikipediaAsOfSearcher
 

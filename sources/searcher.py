@@ -10,13 +10,14 @@ provider twice for the same ceiling. Every returned item is guaranteed
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 import structlog
 
 from common.http.client import HttpClient
-from common.http.errors import HttpError
+from common.http.errors import HttpError, HttpRateLimited
 from common.secrets import SecretProvider
 from core.forecast.search import AsOfSearcher, Evidence
 from sources.asof_filter import filter_as_of
@@ -29,6 +30,7 @@ from sources.snapshot import (
 )
 
 __all__ = [
+    "CircuitBreakerAsOfSearcher",
     "CompositeAsOfSearcher",
     "SourcesAsOfSearcher",
     "build_as_of_searcher",
@@ -117,6 +119,85 @@ class CompositeAsOfSearcher:
                     best[key] = item
         ranked = sorted(best.values(), key=lambda e: (-e.score, e.source, e.source_id))
         return tuple(ranked[: self._max_items])
+
+
+class CircuitBreakerAsOfSearcher:
+    """Skips a rate-limited provider for a cooldown instead of hammering it.
+
+    Keyless APIs like GDELT put a throttled IP into an *extended* cooldown:
+    once 429s start, every further call fails, prolongs the ban, and still
+    pays the politeness interval — a whole eval run can spend hours learning
+    the same "no" (observed: seven straight hours of 429s). After
+    ``failure_threshold`` consecutive trip errors the breaker opens: calls
+    return no evidence immediately, without touching the provider. When
+    ``cooldown_s`` has elapsed, one probe call is let through — success
+    closes the circuit, another trip error re-opens it for a fresh cooldown.
+
+    Only ``trip_on`` errors (rate limits by default) count toward the
+    threshold; other failures propagate unchanged and neither trip nor heal
+    the breaker, so an interleaved outage error cannot mask a throttle. Trip
+    errors are re-raised while the circuit is closed — the composite's
+    skip-and-log handling stays intact. Note the wrapped searcher is
+    snapshot-first, so an open circuit also skips cache replays for the
+    cooldown; acceptable, because eval queries are rarely repeated within
+    one run.
+
+    ``clock`` is injectable (monotonic seconds) so tests never sleep.
+    """
+
+    def __init__(
+        self,
+        inner: AsOfSearcher,
+        *,
+        failure_threshold: int = 3,
+        cooldown_s: float = 900.0,
+        trip_on: tuple[type[Exception], ...] = (HttpRateLimited,),
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if failure_threshold < 1:
+            msg = f"failure_threshold must be >= 1, got {failure_threshold!r}"
+            raise ValueError(msg)
+        if cooldown_s <= 0:
+            msg = f"cooldown_s must be > 0, got {cooldown_s!r}"
+            raise ValueError(msg)
+        self._inner = inner
+        self._threshold = failure_threshold
+        self._cooldown_s = cooldown_s
+        self._trip_on = trip_on
+        self._clock = clock
+        self._consecutive_failures = 0
+        self._open_until: float | None = None
+
+    @property
+    def is_open(self) -> bool:
+        """True while calls are being skipped (cooldown not yet elapsed)."""
+        return self._open_until is not None and self._clock() < self._open_until
+
+    def as_of_search(self, query: str, *, as_of: datetime) -> Sequence[Evidence]:
+        if self._open_until is not None and self._clock() < self._open_until:
+            return ()
+        # Closed, or half-open (cooldown elapsed): let this call probe through.
+        try:
+            items = self._inner.as_of_search(query, as_of=as_of)
+        except self._trip_on:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._threshold:
+                self._open_until = self._clock() + self._cooldown_s
+                _LOG.warning(
+                    "sources.circuit_breaker.open",
+                    provider=type(self._inner).__name__,
+                    consecutive_failures=self._consecutive_failures,
+                    cooldown_s=self._cooldown_s,
+                )
+            raise
+        if self._open_until is not None:
+            _LOG.info(
+                "sources.circuit_breaker.closed",
+                provider=type(self._inner).__name__,
+            )
+        self._open_until = None
+        self._consecutive_failures = 0
+        return items
 
 
 def build_as_of_searcher(

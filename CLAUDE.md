@@ -367,7 +367,10 @@ snapshot version `v2`); the client-side `filter_as_of` remains the exact-timesta
 gate on top, and the production leakage gate audits the raw retrieved snippets
 (SEARCH trace) alongside the ensemble/supervisor traces.
 Retrieval queries are compact entity+horizon strings (`build_evidence_query`);
-GDELT rides only the agentic seed round (6s politeness interval). Retrieval is
+GDELT rides only the agentic seed round (6s politeness interval, single
+attempt, and a circuit breaker: 3 consecutive rate limits skip the provider
+for 15 minutes — a throttled GDELT IP stays throttled for hours, so hammering
+it only buys latency). Retrieval is
 agentic by default (`core/forecast/agentic_search.py`: LLM-planned
 multi-query rounds wrapping the base searcher, budgets via `DELPHI_SEARCH_ROUNDS`
 / `DELPHI_SEARCH_QUERIES`; decomposition sub-questions get their own search pass

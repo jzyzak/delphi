@@ -10,10 +10,11 @@ import pytest
 
 from common.composition import build_test_composition
 from common.http.client import HttpClient
-from common.http.errors import HttpNotFound
+from common.http.errors import HttpNotFound, HttpRateLimited
 from core.forecast.search import AsOfSearcher, Evidence, FixtureAsOfSearch
 from sources.providers.hosted import HostedSearchConfig
 from sources.searcher import (
+    CircuitBreakerAsOfSearcher,
     CompositeAsOfSearcher,
     SourcesAsOfSearcher,
     build_as_of_searcher,
@@ -195,3 +196,123 @@ class TestCompositeAsOfSearcher:
     def test_rejects_bad_max_items(self) -> None:
         with pytest.raises(ValueError, match="max_items"):
             CompositeAsOfSearcher([], max_items=0)
+
+
+class _FakeClock:
+    """Deterministic monotonic clock: tests advance it explicitly, never sleep."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _FlakySearcher:
+    """Inner searcher whose per-call behavior is scripted by the test."""
+
+    def __init__(self) -> None:
+        self.exc: Exception | None = HttpRateLimited("429")
+        self.call_count = 0
+
+    def as_of_search(self, query: str, *, as_of: datetime) -> tuple[Evidence, ...]:
+        self.call_count += 1
+        if self.exc is not None:
+            raise self.exc
+        return (_evidence("gdelt", "http://x", score=0.5),)
+
+
+class TestCircuitBreakerAsOfSearcher:
+    def _breaker(
+        self, inner: _FlakySearcher, clock: _FakeClock, *, threshold: int = 3
+    ) -> CircuitBreakerAsOfSearcher:
+        return CircuitBreakerAsOfSearcher(
+            inner, failure_threshold=threshold, cooldown_s=900.0, clock=clock
+        )
+
+    def _trip(self, breaker: CircuitBreakerAsOfSearcher, times: int) -> None:
+        for _ in range(times):
+            with pytest.raises(HttpRateLimited):
+                breaker.as_of_search("q", as_of=AS_OF)
+
+    def test_is_asof_searcher(self) -> None:
+        breaker = CircuitBreakerAsOfSearcher(FixtureAsOfSearch(), clock=_FakeClock())
+        assert isinstance(breaker, AsOfSearcher)
+
+    def test_below_threshold_failures_propagate_and_keep_calling(self) -> None:
+        inner, clock = _FlakySearcher(), _FakeClock()
+        breaker = self._breaker(inner, clock)
+        self._trip(breaker, 2)
+        assert breaker.is_open is False
+        assert inner.call_count == 2  # still closed: every call reaches the provider
+
+    def test_opens_after_threshold_and_skips_without_calling_inner(self) -> None:
+        inner, clock = _FlakySearcher(), _FakeClock()
+        breaker = self._breaker(inner, clock)
+        self._trip(breaker, 3)
+        assert breaker.is_open is True
+        assert breaker.as_of_search("q", as_of=AS_OF) == ()
+        assert breaker.as_of_search("q2", as_of=AS_OF) == ()
+        assert inner.call_count == 3  # the open circuit never touched the provider
+
+    def test_success_resets_the_consecutive_count(self) -> None:
+        inner, clock = _FlakySearcher(), _FakeClock()
+        breaker = self._breaker(inner, clock)
+        self._trip(breaker, 2)
+        inner.exc = None
+        assert len(breaker.as_of_search("q", as_of=AS_OF)) == 1
+        inner.exc = HttpRateLimited("429")
+        self._trip(breaker, 2)  # a fresh streak: 2 < threshold, still closed
+        assert breaker.is_open is False
+
+    def test_probe_after_cooldown_success_closes(self) -> None:
+        inner, clock = _FlakySearcher(), _FakeClock()
+        breaker = self._breaker(inner, clock)
+        self._trip(breaker, 3)
+        clock.advance(900.0)
+        inner.exc = None
+        assert len(breaker.as_of_search("q", as_of=AS_OF)) == 1  # the probe went through
+        assert breaker.is_open is False
+        assert len(breaker.as_of_search("q2", as_of=AS_OF)) == 1
+        assert inner.call_count == 5
+
+    def test_probe_failure_reopens_for_a_fresh_cooldown(self) -> None:
+        inner, clock = _FlakySearcher(), _FakeClock()
+        breaker = self._breaker(inner, clock)
+        self._trip(breaker, 3)
+        clock.advance(900.0)
+        self._trip(breaker, 1)  # the probe itself rate-limits
+        assert breaker.is_open is True
+        clock.advance(899.0)
+        assert breaker.as_of_search("q", as_of=AS_OF) == ()  # still cooling down
+        assert inner.call_count == 4
+
+    def test_non_trip_errors_propagate_without_counting_or_healing(self) -> None:
+        inner, clock = _FlakySearcher(), _FakeClock()
+        breaker = self._breaker(inner, clock)
+        self._trip(breaker, 2)
+        inner.exc = HttpNotFound("404")
+        with pytest.raises(HttpNotFound):
+            breaker.as_of_search("q", as_of=AS_OF)
+        assert breaker.is_open is False
+        inner.exc = HttpRateLimited("429")
+        self._trip(breaker, 1)  # 404 did not reset the streak: 3rd rate limit opens
+        assert breaker.is_open is True
+
+    def test_composite_skips_open_breaker_silently(self) -> None:
+        inner, clock = _FlakySearcher(), _FakeClock()
+        breaker = self._breaker(inner, clock)
+        self._trip(breaker, 3)
+        other = FixtureAsOfSearch(default=[_evidence("wikipedia", "http://w", score=0.9)])
+        evidence = CompositeAsOfSearcher([breaker, other]).as_of_search("q", as_of=AS_OF)
+        assert [e.source for e in evidence] == ["wikipedia"]
+        assert inner.call_count == 3
+
+    def test_rejects_bad_threshold_and_cooldown(self) -> None:
+        with pytest.raises(ValueError, match="failure_threshold"):
+            CircuitBreakerAsOfSearcher(FixtureAsOfSearch(), failure_threshold=0)
+        with pytest.raises(ValueError, match="cooldown_s"):
+            CircuitBreakerAsOfSearcher(FixtureAsOfSearch(), cooldown_s=0)
