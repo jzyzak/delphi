@@ -127,6 +127,7 @@ reproducibility handle.
 | `delphi resolve [--since TS] [--answers FILE]` | Resolve closed questions from a JSON answer key. |
 | `delphi eval --suite metaculus\|forecastbench [--leakage-audit]` | Retrospective proper scores + baselines + CIs, or a leakage audit. |
 | `delphi bench live --harvest\|--score [--suite S] [--tick TS] [--since TS]` | Nightly live loop: harvest open questions or resolve + score matured ones. |
+| `delphi calibration fit [--output PATH] [--method auto\|isotonic\|platt]` | Fit the recalibrator + extremization alpha + floor on the disjoint calibration split; writes a versioned artifact. |
 | `delphi serve [--host H --port P] [--check]` | Serve the published API. |
 
 `--answers` takes a JSON file mapping question ids to ground truth, e.g.:
