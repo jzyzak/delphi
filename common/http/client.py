@@ -26,6 +26,7 @@ from common.http.errors import (
     HttpError,
     HttpNotFound,
     HttpRateLimited,
+    HttpTransportFailure,
     _TransientHttpError,
 )
 
@@ -125,23 +126,32 @@ class HttpClient:
         json: Any | None = None,
     ) -> httpx.Response:
         cfg = self._config
-        for attempt in Retrying(
-            stop=stop_after_attempt(cfg.max_retries),
-            wait=wait_exponential(multiplier=cfg.retry_backoff_base, max=cfg.retry_backoff_max),
-            retry=retry_if_exception_type(_RETRYABLE),
-            reraise=True,
-        ):
-            with attempt:
-                try:
-                    return self._raw_request(method, url, params=params, headers=headers, json=json)
-                except _RETRYABLE as exc:
-                    _LOG.info(
-                        "http.retryable_error",
-                        url=url,
-                        method=method,
-                        error_type=type(exc).__name__,
-                    )
-                    raise
+        try:
+            for attempt in Retrying(
+                stop=stop_after_attempt(cfg.max_retries),
+                wait=wait_exponential(multiplier=cfg.retry_backoff_base, max=cfg.retry_backoff_max),
+                retry=retry_if_exception_type(_RETRYABLE),
+                reraise=True,
+            ):
+                with attempt:
+                    try:
+                        return self._raw_request(
+                            method, url, params=params, headers=headers, json=json
+                        )
+                    except _RETRYABLE as exc:
+                        _LOG.info(
+                            "http.retryable_error",
+                            url=url,
+                            method=method,
+                            error_type=type(exc).__name__,
+                        )
+                        raise
+        except httpx.TransportError as exc:
+            # Terminal network failure: surface it inside the HttpError taxonomy
+            # so callers (e.g. the composite searcher) can skip the provider
+            # instead of crashing on a raw httpx exception.
+            msg = f"transport failure for {url}: {type(exc).__name__}: {exc}"
+            raise HttpTransportFailure(msg) from exc
         raise HttpError("unreachable")  # pragma: no cover - reraise=True
 
     def get_json(

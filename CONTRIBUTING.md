@@ -21,6 +21,16 @@ Copy `.env.example` to `.env` for local configuration. Unit tests require no net
 no API keys, and no database (Postgres-marked integration tests are opt-in via
 `-m postgres`).
 
+Postgres-marked tests run **only** against a dedicated test database
+(`DELPHI_TEST_PG_DSN`), never `DELPHI_PG_DSN` — they truncate tables and write
+fixture rows, and `tests/conftest.py::postgres_test_dsn` fails hard if the two
+DSNs resolve to the same database:
+
+```bash
+docker compose exec postgres createdb -U postgres delphi_test
+export DELPHI_TEST_PG_DSN="postgresql://postgres:delphi@localhost:5432/delphi_test"
+```
+
 ## The hard gates
 
 Every PR must pass, with no exceptions:

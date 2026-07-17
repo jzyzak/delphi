@@ -67,3 +67,20 @@ def test_health_endpoints_stay_open_with_auth(make_service: MakeService) -> None
     app = DelphiApp(service, auth_token=TOKEN)
     assert app.handle("GET", "/healthz")[0] == 200
     assert app.handle("GET", "/readyz")[0] == 200
+
+
+def test_intake_routes_require_token(make_service: MakeService) -> None:
+    service, _ = make_service()
+    app = DelphiApp(service, auth_token=TOKEN)
+    for path in ("/v1/classify", "/classify", "/v1/formalize", "/formalize"):
+        status, body = app.handle("POST", path, {"question": "q"})
+        assert status == 401, path
+        assert body["error"] == "unauthorized"
+
+
+def test_intake_routes_accept_correct_token(make_service: MakeService) -> None:
+    service, _ = make_service()
+    app = DelphiApp(service, auth_token=TOKEN)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    assert app.handle("POST", "/v1/classify", {"question": "q"}, headers=headers)[0] == 200
+    assert app.handle("POST", "/v1/formalize", {"question": "q"}, headers=headers)[0] == 200

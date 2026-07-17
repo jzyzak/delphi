@@ -59,7 +59,9 @@ class SourcesAsOfSearcher:
         cached = self._snapshots.read(key)
         if cached is not None:
             return cached.evidence
-        response = self._client.search(query, max_results=self._max_results)
+        # The ceiling rides the provider request itself (server-side bound)
+        # where supported; filter_as_of below stays the exact-timestamp gate.
+        response = self._client.search(query, max_results=self._max_results, as_of=as_of)
         evidence = filter_as_of(
             response.results, as_of=as_of, provider=config.provider, query=query
         )

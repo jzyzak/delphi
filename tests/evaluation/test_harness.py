@@ -29,6 +29,20 @@ def _ledger(cap: int) -> InMemoryBudgetLedger:
     return InMemoryBudgetLedger(cap=cap, trials_count=lambda: 0)
 
 
+class TestLedgerObservability:
+    def test_ledger_snapshot_reflects_committed_draws(self) -> None:
+        harness = EvalHarness(budget_ledger=InMemoryBudgetLedger(cap=10))
+        harness.evaluate_guarded(BrierScorer(), _records(4), n_boot=50)
+        snapshot = harness.ledger_snapshot()
+        assert snapshot.debited == 4
+        assert snapshot.outstanding_reserved == 0
+        assert snapshot.cap == 10
+
+    def test_ledger_durable_reflects_backing_store(self) -> None:
+        harness = EvalHarness(budget_ledger=_ledger(10))
+        assert harness.ledger_durable is False
+
+
 class TestEvaluateGuarded:
     def test_scores_and_commits(self) -> None:
         ledger = _ledger(10)

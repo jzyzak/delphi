@@ -11,8 +11,11 @@ log-likelihood-ratios with the base-rate prior via the core Bayesian ensemble.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from datetime import datetime
+
+import numpy as np
 
 from core.forecast.bayesian import EvidenceLikelihoodLLM, elicit_and_build_bayesian_ensemble
 from core.forecast.ensemble import Aggregator, EnsembleForecast, build_ensemble
@@ -29,6 +32,7 @@ __all__ = [
     "assemble_ensemble",
     "build_draw_requests",
     "build_forecast_content",
+    "build_subset_draw_requests",
 ]
 
 METHOD_AGENTS: tuple[str, ...] = (
@@ -49,7 +53,10 @@ _AGENT_PROMPTS: dict[str, str] = {
     ),
     "market_anchored": (
         "Weigh any market, crowd, or expert-consensus signal in the evidence most "
-        "heavily. Report your probability of the event."
+        "heavily — especially a [market_freeze] item, which is the market's own "
+        "estimate of this exact question at the forecast time; treat it as the "
+        "anchor and move off it only for concrete as-of evidence the market "
+        "plausibly missed. Report your probability of the event."
     ),
     "extrapolation": (
         "Extrapolate the most recent as-of trend forward to the resolution date. "
@@ -57,8 +64,22 @@ _AGENT_PROMPTS: dict[str, str] = {
     ),
 }
 
-_SNIPPET_MAX = 300
-_MAX_EVIDENCE = 12
+# Appended to every method-agent prompt. Targets a measured failure mode:
+# confident directional calls on questions that are near-martingales (e.g.
+# "will this stock close above its current price on date X"), where the honest
+# probability sits near the base rate and the model's inside view adds ~nothing.
+_SHARED_DISCIPLINE = (
+    " Discipline: if the question asks whether a traded asset's price (or any "
+    "near-random-walk series) will finish above its current level on a future "
+    "date, the honest probability is close to the base rate / market anchor — "
+    "a confident directional call there requires decisive case-specific as-of "
+    "evidence, not narrative. A [series_estimator] evidence item is a "
+    "deterministic base rate computed arithmetically from the series' own "
+    "history: for series-direction questions, anchor on it."
+)
+
+DEFAULT_SNIPPET_MAX = 500
+DEFAULT_MAX_EVIDENCE = 20
 
 
 def build_forecast_content(
@@ -66,6 +87,9 @@ def build_forecast_content(
     base_rate: BaseRateEstimate,
     decomposition: Decomposition,
     evidence: Sequence[Evidence],
+    *,
+    max_evidence: int = DEFAULT_MAX_EVIDENCE,
+    snippet_max: int = DEFAULT_SNIPPET_MAX,
 ) -> str:
     """Assemble the shared as-of context every method-agent draw reads."""
     lines = [
@@ -81,8 +105,8 @@ def build_forecast_content(
         lines.append(f"Recomposition rule: {decomposition.rule}")
     if evidence:
         lines.append("Evidence (as of the ceiling):")
-        for ev in evidence[:_MAX_EVIDENCE]:
-            lines.append(f"  - [{ev.source_id}] {ev.snippet[:_SNIPPET_MAX]}")
+        for ev in evidence[:max_evidence]:
+            lines.append(f"  - [{ev.source_id}] {ev.snippet[:snippet_max]}")
     else:
         lines.append(
             "Evidence: none retrieved as of the ceiling. Do NOT treat missing "
@@ -118,7 +142,84 @@ def build_draw_requests(
                     content=content,
                     content_hash=digest,
                     run_index=run_index,
-                    prompt=f"[method-agent: {agent}] {prompt}",
+                    prompt=f"[method-agent: {agent}] {prompt}{_SHARED_DISCIPLINE}",
+                )
+            )
+            run_index += 1
+    return tuple(requests)
+
+
+def _subset_seed(digest: str, run_index: int) -> int:
+    """Stable per-draw seed derived from the full-content hash and run index."""
+    raw = hashlib.sha256(f"{digest}:{run_index}".encode()).digest()
+    return int.from_bytes(raw[:8], "big")
+
+
+def build_subset_draw_requests(
+    *,
+    question: str,
+    base_rate: BaseRateEstimate,
+    decomposition: Decomposition,
+    evidence: Sequence[Evidence],
+    agents: Sequence[str] = METHOD_AGENTS,
+    runs_per_agent: int = 1,
+    subset_fraction: float = 1.0,
+    max_evidence: int = DEFAULT_MAX_EVIDENCE,
+    snippet_max: int = DEFAULT_SNIPPET_MAX,
+) -> tuple[ForecastRequest, ...]:
+    """Per-draw seeded evidence subsets: decorrelated draws beyond prompt steering.
+
+    Each (agent, run) draw reads a deterministic ~``subset_fraction`` sample of
+    the evidence (original order preserved), so draws differ in *evidence*, not
+    just method prompt — the decorrelation §3.4 asks the ensemble to have. With
+    ``subset_fraction >= 1`` or fewer than two evidence items this degrades to
+    the shared-content :func:`build_draw_requests` path exactly.
+    """
+    if not 0.0 < subset_fraction <= 1.0:
+        msg = f"subset_fraction must be in (0, 1], got {subset_fraction!r}"
+        raise ValueError(msg)
+    full_content = build_forecast_content(
+        question,
+        base_rate,
+        decomposition,
+        evidence,
+        max_evidence=max_evidence,
+        snippet_max=snippet_max,
+    )
+    if subset_fraction >= 1.0 or len(evidence) < 2:
+        return build_draw_requests(
+            content=full_content, agents=agents, runs_per_agent=runs_per_agent
+        )
+    if runs_per_agent < 1:
+        msg = "runs_per_agent must be >= 1."
+        raise ValueError(msg)
+    if not agents:
+        msg = "at least one method-agent is required."
+        raise ValueError(msg)
+    digest = content_hash(full_content)
+    n_keep = max(1, round(subset_fraction * len(evidence)))
+    requests: list[ForecastRequest] = []
+    run_index = 0
+    for agent in agents:
+        prompt = _AGENT_PROMPTS.get(agent, _AGENT_PROMPTS["inside_view_heavy"])
+        for _ in range(runs_per_agent):
+            rng = np.random.default_rng(_subset_seed(digest, run_index))
+            keep = sorted(rng.choice(len(evidence), size=n_keep, replace=False).tolist())
+            subset = [evidence[i] for i in keep]
+            content = build_forecast_content(
+                question,
+                base_rate,
+                decomposition,
+                subset,
+                max_evidence=max_evidence,
+                snippet_max=snippet_max,
+            )
+            requests.append(
+                ForecastRequest(
+                    content=content,
+                    content_hash=content_hash(content),
+                    run_index=run_index,
+                    prompt=f"[method-agent: {agent}] {prompt}{_SHARED_DISCIPLINE}",
                 )
             )
             run_index += 1

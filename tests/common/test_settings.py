@@ -50,6 +50,97 @@ def test_snapshot_dir_read_from_env() -> None:
     assert settings.snapshot_dir == "/var/delphi/snap"
 
 
+def test_calibration_artifact_path_defaults_to_none() -> None:
+    assert Settings.from_env({}).calibration_artifact_path is None
+
+
+def test_calibration_artifact_path_read_from_env() -> None:
+    settings = Settings.from_env({"DELPHI_CALIBRATION_ARTIFACT": "/var/delphi/cal.json"})
+    assert settings.calibration_artifact_path == "/var/delphi/cal.json"
+
+
+def test_ensemble_knob_defaults() -> None:
+    settings = Settings.from_env({})
+    assert settings.runs_per_agent == 3
+    assert settings.aggregator == "log_odds_trimmed_mean"
+    assert settings.evidence_subset_fraction == 0.8
+
+
+def test_ensemble_knobs_read_from_env() -> None:
+    settings = Settings.from_env(
+        {
+            "DELPHI_RUNS_PER_AGENT": "5",
+            "DELPHI_AGGREGATOR": "median",
+            "DELPHI_EVIDENCE_SUBSET_FRACTION": "1.0",
+        }
+    )
+    assert settings.runs_per_agent == 5
+    assert settings.aggregator == "median"
+    assert settings.evidence_subset_fraction == 1.0
+
+
+def test_search_knob_defaults() -> None:
+    settings = Settings.from_env({})
+    assert settings.search_rounds == 3
+    assert settings.search_queries == 8
+    assert settings.subquestion_searches == 3
+
+
+def test_search_knobs_read_from_env() -> None:
+    settings = Settings.from_env(
+        {
+            "DELPHI_SEARCH_ROUNDS": "1",
+            "DELPHI_SEARCH_QUERIES": "20",
+            "DELPHI_SUBQUESTION_SEARCHES": "0",
+        }
+    )
+    assert settings.search_rounds == 1
+    assert settings.search_queries == 20
+    assert settings.subquestion_searches == 0
+
+
+def test_search_rounds_must_be_integer() -> None:
+    with pytest.raises(MissingSettingError, match="DELPHI_SEARCH_ROUNDS"):
+        Settings.from_env({"DELPHI_SEARCH_ROUNDS": "many"})
+
+
+def test_job_knob_defaults() -> None:
+    settings = Settings.from_env({})
+    assert settings.job_workers == 2
+    assert settings.job_stale_after_s == 1800
+
+
+def test_job_knobs_read_from_env() -> None:
+    settings = Settings.from_env(
+        {
+            "DELPHI_JOB_WORKERS": "4",
+            "DELPHI_JOB_TIMEOUT_S": "3600",
+        }
+    )
+    assert settings.job_workers == 4
+    assert settings.job_stale_after_s == 3600
+
+
+def test_job_workers_must_be_integer() -> None:
+    with pytest.raises(MissingSettingError, match="DELPHI_JOB_WORKERS"):
+        Settings.from_env({"DELPHI_JOB_WORKERS": "a few"})
+
+
+def test_job_timeout_must_be_integer() -> None:
+    with pytest.raises(MissingSettingError, match="DELPHI_JOB_TIMEOUT_S"):
+        Settings.from_env({"DELPHI_JOB_TIMEOUT_S": "an hour"})
+
+
+def test_runs_per_agent_must_be_integer() -> None:
+    with pytest.raises(MissingSettingError, match="DELPHI_RUNS_PER_AGENT"):
+        Settings.from_env({"DELPHI_RUNS_PER_AGENT": "three"})
+
+
+def test_evidence_subset_fraction_must_be_number() -> None:
+    with pytest.raises(MissingSettingError, match="DELPHI_EVIDENCE_SUBSET_FRACTION"):
+        Settings.from_env({"DELPHI_EVIDENCE_SUBSET_FRACTION": "most"})
+
+
 def test_empty_env_pins_each_tier_to_its_capability_class() -> None:
     settings = Settings.from_env({})
     # Default transport is the direct Anthropic (Claude) API.

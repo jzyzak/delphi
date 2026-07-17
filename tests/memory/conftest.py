@@ -5,7 +5,6 @@ Time and embeddings are deterministic; no wall-clock or network is used.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +17,7 @@ from core.memory.index import InMemoryVectorIndex, PostgresVectorIndex
 from core.memory.recall import MemoryRecall
 from core.registry.models import DecisionInput, ResultInput
 from core.registry.store import InMemoryRegistryStore, PostgresRegistryStore
+from tests.conftest import postgres_test_dsn
 from tests.registry.conftest import IncrementingClock, make_experiment_input, make_repro
 
 CLOCK_START = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
@@ -123,18 +123,11 @@ def record_experiment_with_outcome(
     return exp_id
 
 
-def _postgres_dsn() -> str | None:
-    return os.environ.get("DELPHI_PG_DSN")
-
-
 @pytest.fixture
 def postgres_memory_stack() -> Iterator[
     tuple[PostgresRegistryStore, PostgresVectorIndex, MemoryRecall]
 ]:
-    dsn = _postgres_dsn()
-    if not dsn:
-        pytest.skip("DELPHI_PG_DSN not set")
-    assert dsn is not None
+    dsn = postgres_test_dsn()
     clock = IncrementingClock(start=CLOCK_START)
     registry = PostgresRegistryStore.connect(dsn, migrate=True, clock=clock)
     embedder = DeterministicEmbedder(dim=128)

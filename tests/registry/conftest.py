@@ -5,7 +5,6 @@ Time is injected and deterministic; no wall-clock or network is used.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -19,6 +18,7 @@ from core.registry.models import (
     ReproMetadata,
 )
 from core.registry.store import InMemoryRegistryStore, PostgresRegistryStore
+from tests.conftest import postgres_test_dsn
 
 AS_OF = datetime(2024, 6, 1, 0, 0, tzinfo=UTC)
 CLOCK_START = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
@@ -79,15 +79,9 @@ def store() -> InMemoryRegistryStore:
     return InMemoryRegistryStore(clock=IncrementingClock())
 
 
-def _postgres_dsn() -> str | None:
-    return os.environ.get("DELPHI_PG_DSN")
-
-
 @pytest.fixture
 def postgres_store() -> Iterator[PostgresRegistryStore]:
-    dsn = _postgres_dsn()
-    if not dsn:
-        pytest.skip("DELPHI_PG_DSN not set")
+    dsn = postgres_test_dsn()
     store = PostgresRegistryStore.connect(dsn, migrate=True, clock=IncrementingClock())
     try:
         with store._conn.cursor() as cur:  # noqa: SLF001 — test cleanup only

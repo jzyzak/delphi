@@ -1,12 +1,12 @@
-"""Integration tests for PostgresRegistryStore (skipped when DELPHI_PG_DSN unset).
+"""Integration tests for PostgresRegistryStore (skipped when DELPHI_TEST_PG_DSN unset).
 
 These exercise the real DB-level append-only enforcement (R1) and a round-trip
-that mirrors the in-memory reference behavior.
+that mirrors the in-memory reference behavior — against the dedicated TEST
+database only (see tests/conftest.py::postgres_test_dsn).
 """
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 
 import psycopg
@@ -20,6 +20,7 @@ from core.registry.models import (
     ResultInput,
 )
 from core.registry.store import PostgresRegistryStore
+from tests.conftest import postgres_test_dsn
 from tests.registry.conftest import make_experiment_input
 
 pytestmark = pytest.mark.postgres
@@ -61,7 +62,7 @@ def test_forecast_persists_across_a_separate_connection(
         )
     )
 
-    other = PostgresRegistryStore.connect(os.environ["DELPHI_PG_DSN"], migrate=False)
+    other = PostgresRegistryStore.connect(postgres_test_dsn(), migrate=False)
     try:
         assert len(other.evidence_sets_for(qid)) == 1
         assert len(other.forecasts_for(qid)) == 1

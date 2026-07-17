@@ -1,4 +1,11 @@
-"""Robust aggregation and spread computation for forecast ensembles."""
+"""Robust aggregation and spread computation for forecast ensembles.
+
+Log-odds pooling (CLAUDE.md §3.5 — combine in log-odds space) is the default
+combination for the forecast chain: probabilities are clamped, mapped to
+logits, averaged (optionally with symmetric trimming *in logit space*), and
+mapped back. The probability-space ``median``/``trimmed_mean`` aggregators
+remain for comparison and cache compatibility.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +18,12 @@ import numpy as np
 
 from core.forecast.llm import ForecastDraw
 
-Aggregator = Literal["median", "trimmed_mean"]
+Aggregator = Literal["median", "trimmed_mean", "log_odds_mean", "log_odds_trimmed_mean"]
 DEFAULT_TRIM_FRACTION = 0.1
+# Pooling-specific clamp: a draw at exactly 0/1 must not dominate the mean
+# logit, so this is deliberately much looser than the calibration-side 1e-12.
+DEFAULT_POOL_EPS = 1e-3
+_LOG_ODDS_AGGREGATORS = ("log_odds_mean", "log_odds_trimmed_mean")
 
 
 def build_ensemble_config(
@@ -20,9 +31,27 @@ def build_ensemble_config(
     n: int,
     aggregator: Aggregator,
     trim_fraction: float = DEFAULT_TRIM_FRACTION,
+    pool_eps: float = DEFAULT_POOL_EPS,
 ) -> str:
     """Serialize ensemble parameters for content-addressed cache keys."""
-    return f"n={n}|agg={aggregator}|trim={trim_fraction}|spread=std"
+    config = f"n={n}|agg={aggregator}|trim={trim_fraction}|spread=std"
+    if aggregator in _LOG_ODDS_AGGREGATORS:
+        config += f"|pool_eps={pool_eps}"
+    return config
+
+
+def _validate_pool_eps(pool_eps: float) -> None:
+    if not 0.0 < pool_eps < 0.5:
+        msg = f"pool_eps must be in (0, 0.5), got {pool_eps!r}"
+        raise ValueError(msg)
+
+
+def _log_odds_pool(arr: np.ndarray, *, trim_fraction: float, pool_eps: float) -> float:
+    """Mean (optionally trimmed, in logit space) of logits, mapped back via sigmoid."""
+    clamped = np.clip(arr, pool_eps, 1.0 - pool_eps)
+    logits = np.log(clamped / (1.0 - clamped))
+    mean_logit = _trimmed_mean(logits, trim_fraction)  # trim_fraction=0 -> plain mean
+    return float(1.0 / (1.0 + np.exp(-mean_logit)))
 
 
 def aggregate(
@@ -30,6 +59,7 @@ def aggregate(
     aggregator: Aggregator,
     *,
     trim_fraction: float = DEFAULT_TRIM_FRACTION,
+    pool_eps: float = DEFAULT_POOL_EPS,
 ) -> float:
     """Aggregate N forecast probabilities with a robust statistic (no LLM combiner)."""
     if not probabilities:
@@ -40,6 +70,10 @@ def aggregate(
         return float(np.median(arr))
     if aggregator == "trimmed_mean":
         return _trimmed_mean(arr, trim_fraction)
+    if aggregator in _LOG_ODDS_AGGREGATORS:
+        _validate_pool_eps(pool_eps)
+        trim = trim_fraction if aggregator == "log_odds_trimmed_mean" else 0.0
+        return _log_odds_pool(arr, trim_fraction=trim, pool_eps=pool_eps)
     msg = f"unsupported aggregator: {aggregator!r}"
     raise ValueError(msg)
 
@@ -54,7 +88,7 @@ def _trimmed_mean(arr: np.ndarray, trim_fraction: float) -> float:
         return float(np.mean(arr))
     sorted_arr = np.sort(arr)
     trimmed = sorted_arr[n_trim : len(arr) - n_trim]
-    if len(trimmed) == 0:
+    if len(trimmed) == 0:  # pragma: no cover - unreachable: trim <= 0.49 keeps >= 1
         return float(np.median(arr))
     return float(np.mean(trimmed))
 
@@ -91,13 +125,14 @@ def build_ensemble(
     aggregator: Aggregator,
     knowledge_time: datetime,
     trim_fraction: float = DEFAULT_TRIM_FRACTION,
+    pool_eps: float = DEFAULT_POOL_EPS,
 ) -> EnsembleForecast:
     """Build an ensemble forecast from N structured draws."""
     if not draws:
         msg = "draws must be non-empty"
         raise ValueError(msg)
     probabilities = [d.probability for d in draws]
-    agg_prob = aggregate(probabilities, aggregator, trim_fraction=trim_fraction)
+    agg_prob = aggregate(probabilities, aggregator, trim_fraction=trim_fraction, pool_eps=pool_eps)
     spread = ensemble_std(probabilities)
     provenance: dict[str, Any] = {
         "aggregation_method": aggregator,
@@ -107,6 +142,8 @@ def build_ensemble(
         "run_provenance": [dict(d.provenance) for d in draws],
         "raw_probabilities": list(probabilities),
     }
+    if aggregator in _LOG_ODDS_AGGREGATORS:
+        provenance["pool_eps"] = pool_eps
     return EnsembleForecast(
         probability=agg_prob,
         uncertainty=spread,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from common.llm import MalformedLLMOutput, StructuredLLMClient
 from core.forecast.ensemble import EnsembleForecast
+from core.forecast.search import Evidence
 from core.forecast.supervisor import ReconciledForecast
 from core.pit.models import ensure_utc
 
@@ -336,6 +337,39 @@ def trace_from_ensemble(
     )
 
 
+def trace_from_evidence(
+    evidence: Sequence[Evidence],
+    *,
+    as_of: datetime,
+    forecast_id: str = "",
+) -> Trace:
+    """Build an auditable SEARCH trace over the retrieved evidence snippets.
+
+    The raw snippets are exactly where a retrieval-side leak lands (a misdated
+    document, a live-fetched extract carrying post-as-of edits), so the judge
+    must read them directly — auditing only downstream summaries leaves the
+    weakest retrieval path uncovered.
+    """
+    payload = [
+        {
+            "source": item.source,
+            "source_id": item.source_id,
+            "knowledge_time": item.knowledge_time.isoformat(),
+            "score": item.score,
+            "query": item.query,
+            "snippet": item.snippet,
+        }
+        for item in evidence
+    ]
+    return Trace(
+        component=TraceComponent.SEARCH,
+        as_of=as_of,
+        text=json.dumps(payload, sort_keys=True, default=str),
+        forecast_id=forecast_id,
+        metadata={"n_evidence": len(payload)},
+    )
+
+
 def trace_from_supervisor(
     forecast: ReconciledForecast,
     *,
@@ -461,5 +495,6 @@ __all__ = [
     "audit_and_quarantine",
     "render_trajectory",
     "trace_from_ensemble",
+    "trace_from_evidence",
     "trace_from_supervisor",
 ]

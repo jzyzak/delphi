@@ -14,6 +14,7 @@ from common.http import (
     HttpError,
     HttpNotFound,
     HttpRateLimited,
+    HttpTransportFailure,
 )
 
 
@@ -123,7 +124,10 @@ def test_invalid_json_raises_http_error() -> None:
         client.get_json("https://x/y")
 
 
-def test_transport_error_retried_then_reraised() -> None:
+def test_transport_error_retried_then_wrapped_as_http_error() -> None:
+    # A terminal network failure must surface inside the HttpError taxonomy —
+    # a raw httpx exception escaping here crashed a full ablation run when one
+    # GDELT SSL handshake timed out (2026-07-15).
     calls = {"n": 0}
 
     def handler(_req: httpx.Request) -> httpx.Response:
@@ -131,9 +135,19 @@ def test_transport_error_retried_then_reraised() -> None:
         raise httpx.ConnectError("boom")
 
     client = _client(handler, max_retries=2)
-    with pytest.raises(httpx.TransportError):
+    with pytest.raises(HttpTransportFailure, match="transport failure") as excinfo:
         client.get_json("https://x/y")
     assert calls["n"] == 2
+    assert isinstance(excinfo.value, HttpError)
+
+
+def test_connect_timeout_wrapped_as_http_error() -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("_ssl.c:983: The handshake operation timed out")
+
+    client = _client(handler, max_retries=1)
+    with pytest.raises(HttpTransportFailure, match="ConnectTimeout"):
+        client.get_json("https://x/y")
 
 
 def test_post_json_sends_body_and_parses_response() -> None:

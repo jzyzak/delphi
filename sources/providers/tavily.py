@@ -16,6 +16,7 @@ The as-of filter (Prime Directive §2.1) drops undated results as unsafe, so
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from common.http.client import HttpClient
@@ -25,6 +26,7 @@ from sources.providers.hosted import (
     HostedSearchConfig,
     HostedSearchResponse,
     HostedSearchResult,
+    as_of_date_bound,
 )
 
 __all__ = [
@@ -40,7 +42,10 @@ _TAVILY_URL = "https://api.tavily.com/search"
 def tavily_config(
     *,
     base_url: str = _TAVILY_URL,
-    version: str = "v1",
+    # v2: queries carry a server-side ``end_date`` as-of bound. The version is
+    # part of the snapshot key, so bumping it retires v1 snapshots retrieved
+    # against the live (as-of-blind) index — their ranking saw the future.
+    version: str = "v2",
     search_depth: str = "advanced",
     topic: str = "news",
     api_key_secret: str = TAVILY_API_KEY_SECRET,
@@ -84,7 +89,9 @@ class TavilySearchClient(HostedSearchClient):
             return {self._config.api_key_header: f"Bearer {key}"}
         return None
 
-    def search(self, query: str, *, max_results: int = 10) -> HostedSearchResponse:
+    def search(
+        self, query: str, *, max_results: int = 10, as_of: datetime | None = None
+    ) -> HostedSearchResponse:
         if max_results < 1:
             msg = "max_results must be >= 1."
             raise ValueError(msg)
@@ -93,6 +100,12 @@ class TavilySearchClient(HostedSearchClient):
             "max_results": max_results,
             **self._config.extra_params,
         }
+        if as_of is not None:
+            # Server-side as-of bound (§2.1): restrict retrieval AND ranking to
+            # publications on or before the ceiling, so post-as-of events cannot
+            # shape which pre-as-of articles surface. Day-granular — the exact
+            # timestamp is still enforced downstream by ``filter_as_of``.
+            body["end_date"] = as_of_date_bound(as_of)
         payload = self._http.post_json(
             self._config.base_url, json=body, headers=self._bearer_headers()
         )

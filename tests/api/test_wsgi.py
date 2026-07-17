@@ -63,6 +63,22 @@ def test_forecast_round_trip(make_service: MakeService) -> None:
     assert body["object"] == "forecast.completion"  # type: ignore[index]
 
 
+def test_classify_round_trip(make_service: MakeService) -> None:
+    service, _ = make_service()
+    app = wsgi_application(DelphiApp(service))
+    status, _, body = _call(app, "POST", "/v1/classify", body={"question": "q"})
+    assert status == "200 OK"
+    assert body["object"] == "question.classification"  # type: ignore[index]
+
+
+def test_formalize_round_trip(make_service: MakeService) -> None:
+    service, _ = make_service()
+    app = wsgi_application(DelphiApp(service))
+    status, _, body = _call(app, "POST", "/v1/formalize", body={"question": "q"})
+    assert status == "200 OK"
+    assert body["object"] == "question.formalization"  # type: ignore[index]
+
+
 def test_invalid_json_body_returns_400(make_service: MakeService) -> None:
     service, _ = make_service()
     app = wsgi_application(DelphiApp(service))

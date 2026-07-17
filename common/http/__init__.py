@@ -8,7 +8,12 @@ from __future__ import annotations
 
 from common.http.client import HttpClient
 from common.http.config import HttpConfig
-from common.http.errors import HttpError, HttpNotFound, HttpRateLimited
+from common.http.errors import (
+    HttpError,
+    HttpNotFound,
+    HttpRateLimited,
+    HttpTransportFailure,
+)
 
 __all__ = [
     "HttpClient",
@@ -16,4 +21,5 @@ __all__ = [
     "HttpError",
     "HttpNotFound",
     "HttpRateLimited",
+    "HttpTransportFailure",
 ]

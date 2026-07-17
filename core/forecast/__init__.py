@@ -10,6 +10,14 @@ Uncertainty details: [UNCERTAINTY_DOCUMENTATION.md](UNCERTAINTY_DOCUMENTATION.md
 Leakage judge: [LEAKAGE_JUDGE_DOCUMENTATION.md](LEAKAGE_JUDGE_DOCUMENTATION.md).
 """
 
+from core.forecast.agentic_search import (
+    AgenticAsOfSearcher,
+    BedrockQueryPlannerLLM,
+    FixtureQueryPlanner,
+    QueryPlan,
+    QueryPlannerLLM,
+    rank_evidence,
+)
 from core.forecast.bayesian import (
     BayesianEnsembleResult,
     BedrockEvidenceLikelihoodLLM,
@@ -104,10 +112,12 @@ from core.forecast.uncertainty import (
 )
 
 __all__ = [
+    "AgenticAsOfSearcher",
     "BayesianEnsembleResult",
     "BedrockEvidenceLikelihoodLLM",
     "BedrockForecastLLM",
     "BedrockLeakageJudgeLLM",
+    "BedrockQueryPlannerLLM",
     "BedrockSupervisorLLM",
     "EvidenceLikelihoodLLM",
     "FixtureEvidenceLikelihoodLLM",
@@ -136,6 +146,7 @@ __all__ = [
     "FixtureAsOfSearch",
     "FixtureLeakageJudgeLLM",
     "FixtureForecastLLM",
+    "FixtureQueryPlanner",
     "FixtureSupervisorLLM",
     "FixtureSupervisorResponse",
     "ForecastDraw",
@@ -148,6 +159,8 @@ __all__ = [
     "LeakageReport",
     "LeakageVerdict",
     "QuarantineRecord",
+    "QueryPlan",
+    "QueryPlannerLLM",
     "RegistrySlice",
     "Trace",
     "TraceComponent",
@@ -176,6 +189,7 @@ __all__ = [
     "combine_uncertainty",
     "detect_disagreement",
     "ensemble_std",
+    "rank_evidence",
     "event_uncertainty",
     "llm_output_uncertainty",
     "near_decision_boundary",

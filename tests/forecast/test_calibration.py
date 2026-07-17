@@ -11,6 +11,8 @@ from core.forecast.calibration import (
     DEFAULT_ALPHA,
     DEFAULT_BOUNDARY_MARGIN,
     DEFAULT_SPREAD_THRESHOLD,
+    FrozenCalibration,
+    apply_floor,
     calibrate,
     calibrate_ensemble,
     near_decision_boundary,
@@ -178,3 +180,157 @@ class TestCalibrateFailureModes:
     def test_failure_invalid_spread_threshold_raises(self) -> None:
         with pytest.raises(ValueError, match="spread_threshold"):
             near_decision_boundary(0.5, 0.1, spread_threshold=-0.01)
+
+
+class TestApplyFloor:
+    """Floor clamp: final probabilities live in [floor, 1 - floor]."""
+
+    def test_none_is_identity(self) -> None:
+        assert apply_floor(0.001, None) == 0.001
+
+    def test_clamps_low_tail(self) -> None:
+        assert apply_floor(0.001, 0.01) == pytest.approx(0.01)
+
+    def test_clamps_high_tail(self) -> None:
+        assert apply_floor(0.999, 0.01) == pytest.approx(0.99)
+
+    def test_interior_untouched(self) -> None:
+        assert apply_floor(0.4, 0.01) == 0.4
+
+    @pytest.mark.parametrize("floor", [-0.01, 0.5, 0.7, float("nan")])
+    def test_invalid_floor_raises(self, floor: float) -> None:
+        with pytest.raises(ValueError, match="floor"):
+            apply_floor(0.4, floor)
+
+    def test_invalid_probability_raises(self) -> None:
+        with pytest.raises(ValueError, match="probability"):
+            apply_floor(1.5, 0.01)
+
+
+_ISOTONIC_DICT = {
+    "schema_version": 1,
+    "method": "isotonic",
+    "recalibrator": {"x": [0.1, 0.4, 0.6, 0.9], "y": [0.05, 0.2, 0.7, 0.95], "n": 4},
+    "alpha": 1.25,
+    "floor": 0.01,
+    "n": 4,
+    "fitted": {"seed": 0},
+}
+
+_PLATT_DICT = {
+    "schema_version": 1,
+    "method": "platt",
+    "recalibrator": {"a": 2.0, "b": 0.5, "n": 12},
+    "alpha": 1.0,
+    "floor": None,
+    "n": 12,
+}
+
+
+class TestFrozenCalibration:
+    """The apply-only artifact reader the live chain consumes."""
+
+    def test_isotonic_interpolates_between_knots(self) -> None:
+        learned = FrozenCalibration.from_dict(_ISOTONIC_DICT)
+        # Midpoint of the (0.4, 0.2) -> (0.6, 0.7) segment.
+        assert learned.apply(0.5) == pytest.approx(0.45)
+
+    def test_isotonic_flat_extrapolation_and_clamp(self) -> None:
+        learned = FrozenCalibration.from_dict(_ISOTONIC_DICT)
+        assert learned.apply(0.0) == pytest.approx(0.05)
+        assert learned.apply(1.0) == pytest.approx(0.95)
+        clamped = FrozenCalibration.from_dict(
+            {
+                **_ISOTONIC_DICT,
+                "recalibrator": {"x": [0.0, 1.0], "y": [0.0, 1.0], "n": 2},
+            }
+        )
+        assert 0.0 < clamped.apply(0.0) < clamped.apply(1.0) < 1.0
+
+    def test_platt_applies_logistic_map(self) -> None:
+        learned = FrozenCalibration.from_dict(_PLATT_DICT)
+        logit = math.log(0.7 / 0.3)
+        expected = 1.0 / (1.0 + math.exp(-(2.0 * logit + 0.5)))
+        assert learned.apply(0.7) == pytest.approx(expected)
+
+    def test_platt_extreme_input_is_clamped(self) -> None:
+        learned = FrozenCalibration.from_dict(_PLATT_DICT)
+        assert 0.0 < learned.apply(0.0) < learned.apply(1.0) < 1.0
+
+    def test_carries_alpha_floor_and_provenance(self) -> None:
+        learned = FrozenCalibration.from_dict(_ISOTONIC_DICT, artifact_hash="abc123")
+        assert learned.alpha == 1.25
+        assert learned.floor == 0.01
+        prov = learned.provenance
+        assert prov["recalibrator"] == "isotonic"
+        assert prov["fitted"] is True
+        assert prov["n"] == 4
+        assert prov["artifact_hash"] == "abc123"
+        assert prov["seed"] == 0
+
+    def test_fallback_flag_lands_in_provenance(self) -> None:
+        learned = FrozenCalibration.from_dict({**_PLATT_DICT, "fallback": True})
+        assert learned.provenance["fallback"] is True
+
+    def test_fallback_defaults_false_in_provenance(self) -> None:
+        learned = FrozenCalibration.from_dict(_PLATT_DICT)
+        assert learned.provenance["fallback"] is False
+
+    def test_pre_schema_version_dict_defaults_to_isotonic(self) -> None:
+        legacy = {
+            "recalibrator": {"x": [0.1, 0.9], "y": [0.0, 1.0], "n": 2},
+            "alpha": 1.5,
+        }
+        learned = FrozenCalibration.from_dict(legacy)
+        assert learned.method == "isotonic"
+        assert learned.floor is None
+
+    def test_unsupported_schema_version_raises(self) -> None:
+        with pytest.raises(ValueError, match="schema_version"):
+            FrozenCalibration.from_dict({**_ISOTONIC_DICT, "schema_version": 99})
+
+    def test_unknown_method_raises(self) -> None:
+        with pytest.raises(ValueError, match="method"):
+            FrozenCalibration.from_dict({**_ISOTONIC_DICT, "method": "spline"})
+
+    def test_unknown_method_constructor_raises(self) -> None:
+        with pytest.raises(ValueError, match="method"):
+            FrozenCalibration(method="spline", alpha=1.0)
+
+    def test_isotonic_requires_knots(self) -> None:
+        with pytest.raises(ValueError, match="knot"):
+            FrozenCalibration(method="isotonic", alpha=1.0)
+
+    def test_isotonic_requires_equal_length_knots(self) -> None:
+        with pytest.raises(ValueError, match="knot"):
+            FrozenCalibration(method="isotonic", alpha=1.0, x_knots=(0.1, 0.9), y_knots=(0.5,))
+
+    def test_invalid_alpha_raises(self) -> None:
+        with pytest.raises(ValueError, match="alpha"):
+            FrozenCalibration.from_dict({**_PLATT_DICT, "alpha": -1.0})
+
+    def test_invalid_floor_raises(self) -> None:
+        with pytest.raises(ValueError, match="floor"):
+            FrozenCalibration.from_dict({**_PLATT_DICT, "floor": 0.6})
+
+    def test_invalid_probability_raises(self) -> None:
+        learned = FrozenCalibration.from_dict(_PLATT_DICT)
+        with pytest.raises(ValueError, match="probability"):
+            learned.apply(-0.1)
+
+    def test_duplicate_knot_x_uses_first_matching_segment(self) -> None:
+        # PAV-fit knots can carry tied x values; an exact-tie query resolves via
+        # the first segment whose upper knot bounds it (np.interp agreement is
+        # checked by the evaluation-side parity test).
+        learned = FrozenCalibration(
+            method="isotonic",
+            alpha=1.0,
+            x_knots=(0.2, 0.5, 0.5, 0.8),
+            y_knots=(0.1, 0.3, 0.6, 0.9),
+        )
+        assert learned.apply(0.5) == pytest.approx(0.3)
+
+    def test_satisfies_recalibrator_protocol(self) -> None:
+        from forecaster.stages.calibrate import Recalibrator
+
+        assert isinstance(FrozenCalibration.from_dict(_PLATT_DICT), Recalibrator)

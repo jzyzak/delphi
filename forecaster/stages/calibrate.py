@@ -16,6 +16,7 @@ from core.forecast.calibration import (
     DEFAULT_BOUNDARY_MARGIN,
     DEFAULT_SPREAD_THRESHOLD,
     CalibratedForecast,
+    apply_floor,
     calibrate,
     near_decision_boundary,
 )
@@ -63,15 +64,20 @@ def calibrate_reconciled(
     *,
     recalibrator: Recalibrator | None = None,
     alpha: float = DEFAULT_ALPHA,
+    floor: float | None = None,
     boundary_margin: float = DEFAULT_BOUNDARY_MARGIN,
     spread_threshold: float = DEFAULT_SPREAD_THRESHOLD,
     uncertainty_config: UncertaintyConfig | None = None,
 ) -> tuple[CalibratedForecast, Uncertainty]:
-    """Recalibrate then extremize the reconciled probability; quantify uncertainty."""
+    """Recalibrate, extremize, and floor-clamp the reconciled probability.
+
+    ``floor`` (fit on the calibration split, §2.5) clamps the final probability
+    to ``[floor, 1 - floor]`` — the guard against confidently-wrong tails.
+    """
     recal = recalibrator if recalibrator is not None else IdentityRecalibrator()
     raw_p = reconciled.probability
     recalibrated_p = recal.apply(raw_p)
-    calibrated_p = calibrate(recalibrated_p, alpha=alpha)
+    calibrated_p = apply_floor(calibrate(recalibrated_p, alpha=alpha), floor)
     spread = reconciled.uncertainty
     diagnostic = near_decision_boundary(
         recalibrated_p,
@@ -87,6 +93,7 @@ def calibrate_reconciled(
         provenance={
             "calibration_method": "recalibrate_then_platt_logodds_extremization",
             "alpha": alpha,
+            "floor": floor,
             "raw_probability": raw_p,
             "recalibrated_probability": recalibrated_p,
             "calibrated_probability": calibrated_p,

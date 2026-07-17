@@ -45,6 +45,8 @@ USER delphi
 EXPOSE 8080
 
 # gunicorn workers are I/O-bound (they wait on LLM/search calls), so a longer
-# timeout and a modest worker count are appropriate. Tune via WEB_CONCURRENCY /
+# timeout and a modest worker count are appropriate. --threads > 1 selects the
+# gthread worker so long-polls on /v1/forecast/jobs/{id}?wait=N cannot starve
+# the worker pool. Tune via WEB_CONCURRENCY / GUNICORN_THREADS /
 # GUNICORN_TIMEOUT / PORT at deploy time.
-CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers ${WEB_CONCURRENCY:-2} --timeout ${GUNICORN_TIMEOUT:-300} --access-logfile - --error-logfile - api.wsgi:application"]
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers ${WEB_CONCURRENCY:-2} --threads ${GUNICORN_THREADS:-8} --timeout ${GUNICORN_TIMEOUT:-300} --access-logfile - --error-logfile - api.wsgi:application"]

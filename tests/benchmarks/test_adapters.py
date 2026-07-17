@@ -42,6 +42,17 @@ class TestForecastBench:
         assert q.domain == "tech"
         assert q.close_time is not None
 
+    def test_freeze_value_lands_in_metadata(self) -> None:
+        adapter = ForecastBenchAdapter.from_records(
+            [
+                {"id": "q1", "question": "Priced?", "as_of": _AS_OF, "freeze_value": 0.62},
+                {"id": "q2", "question": "Unpriced?", "as_of": _AS_OF},
+            ]
+        )
+        priced, unpriced = adapter.questions()
+        assert priced.metadata["freeze_value"] == 0.62
+        assert "freeze_value" not in unpriced.metadata
+
 
 class TestMetaculus:
     def test_map_and_community_prediction(self) -> None:

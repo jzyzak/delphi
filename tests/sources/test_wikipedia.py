@@ -282,6 +282,34 @@ class TestWikipediaAsOfSearcher:
         evidence = _searcher(handler).as_of_search("q", as_of=AS_OF)
         assert evidence[0].snippet == "Slotless"
 
+    def test_non_dict_main_slot_yields_title_snippet(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            params = dict(req.url.params)
+            if params.get("list") == "search":
+                return httpx.Response(
+                    200, json={"query": {"search": [{"pageid": 1, "title": "BadMain"}]}}
+                )
+            page = {
+                "pageid": 1,
+                "title": "BadMain",
+                "revisions": [
+                    {
+                        "revid": 2,
+                        "timestamp": "2024-01-01T00:00:00Z",
+                        "slots": {"main": "not a dict"},
+                    }
+                ],
+            }
+            return httpx.Response(200, json={"query": {"pages": [page]}})
+
+        evidence = _searcher(handler).as_of_search("q", as_of=AS_OF)
+        assert evidence[0].snippet == "BadMain"
+
+    def test_config_property_exposes_config(self) -> None:
+        config = WikipediaConfig(snippet_chars=42)
+        searcher = _searcher(lambda _r: httpx.Response(200, json={}), config=config)
+        assert searcher.config is config
+
     def test_rejects_bad_max_results_at_construction(self) -> None:
         with pytest.raises(ValueError, match="max_results"):
             _searcher(lambda _r: httpx.Response(200, json={}), max_results=0)

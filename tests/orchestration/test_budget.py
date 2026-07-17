@@ -1,13 +1,14 @@
 """Tests for the trials-budget ledger (CLAUDE.md §2.4).
 
 The in-memory ledger is exercised directly; the Postgres ledger's append-only
-``trials_ledger`` write on commit is verified against a real database when
-``DELPHI_PG_DSN`` is set (skipped otherwise, mirroring the registry tests).
+``trials_ledger`` write on commit is verified against a dedicated TEST database
+when ``DELPHI_TEST_PG_DSN`` is set (skipped otherwise). These fixtures TRUNCATE
+tables and write frozen-clock rows, so they must never point at the production
+database — ``postgres_test_dsn`` fails hard if they do.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 
 import pytest
@@ -17,6 +18,7 @@ from core.orchestration.budget import (
     InMemoryBudgetLedger,
     PostgresBudgetLedger,
 )
+from tests.conftest import postgres_test_dsn
 from tests.registry.conftest import IncrementingClock
 
 
@@ -59,16 +61,46 @@ class TestInMemoryBudgetLedger:
         ledger.commit(BudgetGrant(grant_id="nope", n=1))  # no error
         assert ledger.snapshot().outstanding_reserved == 0
 
+    def test_default_counts_own_committed_trials(self) -> None:
+        # Without an injected trials_count, committed grants ARE the debit — a
+        # fresh reserve must see prior spend, not zero (§2.4).
+        ledger = InMemoryBudgetLedger(cap=5)
+        grant = ledger.reserve_budget(n=3)
+        assert grant is not None
+        ledger.commit(grant)
+        assert ledger.snapshot().debited == 3
+        assert ledger.reserve_budget(n=3) is None
+        assert ledger.reserve_budget(n=2) is not None
 
-def _postgres_dsn() -> str | None:
-    return os.environ.get("DELPHI_PG_DSN")
+    def test_default_released_grants_do_not_debit(self) -> None:
+        ledger = InMemoryBudgetLedger(cap=5)
+        grant = ledger.reserve_budget(n=4)
+        assert grant is not None
+        ledger.release(grant)
+        assert ledger.snapshot().debited == 0
+        assert ledger.reserve_budget(n=5) is not None
+
+    def test_injected_trials_count_overrides_internal(self) -> None:
+        ledger = InMemoryBudgetLedger(cap=5, trials_count=lambda: 4)
+        grant = ledger.reserve_budget(n=1)
+        assert grant is not None
+        ledger.commit(grant)
+        # External count wins: internal committed grants are not added on top.
+        assert ledger.snapshot().debited == 4
+
+    def test_not_durable(self) -> None:
+        assert InMemoryBudgetLedger(cap=1).durable is False
+
+    def test_postgres_ledger_is_durable(self) -> None:
+        from unittest.mock import MagicMock
+
+        # Construction takes no network; durability is a class-level fact.
+        assert PostgresBudgetLedger(MagicMock(), cap=1).durable is True
 
 
 @pytest.fixture
 def postgres_ledger() -> Iterator[PostgresBudgetLedger]:
-    dsn = _postgres_dsn()
-    if not dsn:
-        pytest.skip("DELPHI_PG_DSN not set")
+    dsn = postgres_test_dsn()
     ledger = PostgresBudgetLedger.connect(dsn, cap=100, migrate=True, clock=IncrementingClock())
     try:
         with ledger._conn.cursor() as cur:  # noqa: SLF001 — test cleanup only

@@ -109,6 +109,36 @@ class TestHarvestJob:
         assert run.count == 0
         assert run.refused == ("live:a",)
 
+    def test_harvest_writes_pending_corpus_tuple(self) -> None:
+        from conductor.corpus import CorpusWriter, InMemoryCorpusStore
+
+        store = InMemoryRegistryStore()
+        corpus = InMemoryCorpusStore()
+        adapter = LiveHarvestAdapter.harvest(
+            [{"id": "a", "question": "Will X ship?"}], harvest_time=_HARVEST_TIME
+        )
+        writer = CorpusWriter(store=store, corpus=corpus)
+        run = HarvestJob(conductor=_conductor(store), corpus_writer=writer).run(adapter)
+        assert run.count == 1
+        assert len(corpus) == 1
+        tuple_ = next(iter(corpus))
+        # The workflow trace is preserved on the pending row (§4 provenance).
+        assert tuple_.workflow["route"]
+        assert not tuple_.resolved
+        assert tuple_.proper_score is None
+
+    def test_refused_question_writes_no_corpus_tuple(self) -> None:
+        from conductor.corpus import CorpusWriter, InMemoryCorpusStore
+
+        store = InMemoryRegistryStore()
+        corpus = InMemoryCorpusStore()
+        adapter = LiveHarvestAdapter.harvest(
+            [{"id": "a", "question": "Mmm?"}], harvest_time=_HARVEST_TIME
+        )
+        writer = CorpusWriter(store=store, corpus=corpus)
+        HarvestJob(conductor=_refusing_conductor(store), corpus_writer=writer).run(adapter)
+        assert len(corpus) == 0
+
     def test_harvest_threads_benchmark_id_into_metadata(self) -> None:
         from resolution.benchmark_source import BENCHMARK_QUESTION_ID_KEY
 
@@ -122,6 +152,31 @@ class TestHarvestJob:
         assert question.metadata[BENCHMARK_QUESTION_ID_KEY] == "live:a"
         assert question.metadata["benchmark_source"] == "live"
         assert question.metadata["benchmark_external_id"] == "a"
+
+    def test_harvest_threads_freeze_value_into_metadata(self) -> None:
+        from benchmarks.base import BenchmarkQuestion
+
+        class _FrozenAdapter:
+            name = "stub"
+
+            def questions(self):
+                return (
+                    BenchmarkQuestion(
+                        source="stub",
+                        external_id="a",
+                        text="Will X ship?",
+                        as_of=_HARVEST_TIME,
+                        metadata={"freeze_value": 0.62},
+                    ),
+                )
+
+            def resolutions(self):
+                return ()
+
+        store = InMemoryRegistryStore()
+        HarvestJob(conductor=_conductor(store)).run(_FrozenAdapter())
+        question = store.all_questions()[0]
+        assert question.metadata["market_freeze_value"] == 0.62
 
 
 class TestScoreCollection:
@@ -237,6 +292,41 @@ class TestScoreJob:
         assert len(run.resolved) == 1
         assert run.metrics.n == 1
         assert run.metrics.brier == pytest.approx((0.7 - 1.0) ** 2)
+
+    def test_score_completes_pending_corpus_tuples(self) -> None:
+        from conductor.corpus import CorpusWriter, InMemoryCorpusStore
+
+        store = InMemoryRegistryStore()
+        corpus = InMemoryCorpusStore()
+        writer = CorpusWriter(store=store, corpus=corpus)
+
+        # Harvest writes the pending row (with the workflow trace)...
+        adapter = LiveHarvestAdapter.harvest(
+            [{"id": "a", "question": "Will X ship?"}], harvest_time=_HARVEST_TIME
+        )
+        harvest = HarvestJob(conductor=_conductor(store), corpus_writer=writer).run(adapter)
+        qid = harvest.pending[0]
+
+        # ... and the score job completes it once the question resolves.
+        service = ResolutionService(
+            store=store,
+            source=MappingResolutionSource(
+                {
+                    qid: ResolvedOutcome(
+                        resolved_value=1.0,
+                        resolved_at=datetime(2026, 12, 1, tzinfo=UTC),
+                        source="gov",
+                    )
+                }
+            ),
+        )
+        run = ScoreJob(store=store, resolution_service=service, corpus_writer=writer).run()
+        assert len(run.resolved) == 1  # resolution ids, one per newly resolved question
+        scored = corpus.latest_for(qid)
+        assert scored is not None
+        assert scored.resolved
+        assert scored.proper_score is not None
+        assert scored.workflow["route"]  # provenance survived harvest -> score
 
 
 class TestClaimAndRun:

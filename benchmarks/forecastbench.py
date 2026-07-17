@@ -49,6 +49,12 @@ class ForecastBenchAdapter:
         questions: list[BenchmarkQuestion] = []
         resolutions: list[BenchmarkResolution] = []
         for record in records:
+            metadata: dict[str, Any] = {"benchmark": _SOURCE}
+            if record.get("freeze_value") is not None:
+                # The market/crowd value at the freeze — as-of-safe by
+                # definition (recorded at the forecast time), and worth
+                # feeding to the forecaster as evidence.
+                metadata["freeze_value"] = float(record["freeze_value"])
             question = BenchmarkQuestion(
                 source=_SOURCE,
                 external_id=str(record["id"]),
@@ -58,7 +64,7 @@ class ForecastBenchAdapter:
                 domain=str(record.get("domain", "general")),
                 resolution_criteria=str(record.get("resolution_criteria", "")),
                 close_time=parse_dt(record["close_time"]) if record.get("close_time") else None,
-                metadata={"benchmark": _SOURCE},
+                metadata=metadata,
             )
             questions.append(question)
             if record.get("resolved_value") is not None and record.get("resolved_at"):

@@ -347,7 +347,64 @@ conductor payoff, and are pure upside gated behind the holdout.
 
 *One thing still to settle: the public name (DELPHI vs. final brand). The §8 CLI now
 exists at `common/cli.py` (entry point `delphi`); `intake`, `forecast`, `resolve`,
-`conductor`, `eval`, `bench live`, `serve`, and `doctor` are wired. `eval --suite
+`conductor`, `eval`, `bench live`, `calibration fit`, `serve`, and `doctor` are wired.
+`delphi calibration fit` fits the recalibrator (isotonic/Platt via CV) + extremization
+alpha + probability floor on the disjoint calibration split and writes a versioned
+artifact; export `DELPHI_CALIBRATION_ARTIFACT` to load it into the live chain.
+Calibration is fit on a separate historical corpus (the registry), never carved
+out of small pilots: `delphi eval --calibration-artifact <path>` applies the
+pre-fitted map to ALL questions (fingerprint check refuses fit/score overlap,
+§2.5), and a fit below 10 points returns a labeled identity FALLBACK so a
+starved fit can never degrade the score; isotonic needs ≥30 points to beat
+Platt in CV.
+Evidence comes from three providers (`DELPHI_EVIDENCE_PROVIDERS`, default
+`tavily,gdelt,wikipedia`, fan-out via `sources/searcher.py::CompositeAsOfSearcher`):
+Tavily for current news, GDELT DOC 2.0 (query-time `enddatetime` bound) and
+Wikipedia revision history (`rvstart`+`rvdir=older`) for *historical* as-of
+evidence — retrospective benchmarks are meaningless without the latter two.
+All three now carry a *server-side* as-of bound (Tavily: `end_date`, day-granular,
+snapshot version `v2`); the client-side `filter_as_of` remains the exact-timestamp
+gate on top, and the production leakage gate audits the raw retrieved snippets
+(SEARCH trace) alongside the ensemble/supervisor traces.
+Retrieval queries are compact entity+horizon strings (`build_evidence_query`);
+GDELT rides only the agentic seed round (6s politeness interval). Retrieval is
+agentic by default (`core/forecast/agentic_search.py`: LLM-planned
+multi-query rounds wrapping the base searcher, budgets via `DELPHI_SEARCH_ROUNDS`
+/ `DELPHI_SEARCH_QUERIES`; decomposition sub-questions get their own search pass
+via `DELPHI_SUBQUESTION_SEARCHES`), the ensemble is 4 method-agents x
+`DELPHI_RUNS_PER_AGENT` (default 3) draws over seeded evidence subsets
+(`DELPHI_EVIDENCE_SUBSET_FRACTION`), pooled in log-odds space
+(`DELPHI_AGGREGATOR`, default `log_odds_trimmed_mean`). `eval --suite
 metaculus|forecastbench` and `bench live` run against the Metaculus API and the
-ForecastBench dataset repo via `benchmarks/fetchers/` + `benchmarks/suites.py`; the
-learned conductor remains the main deferred milestone.*
+ForecastBench dataset repo via `benchmarks/fetchers/` + `benchmarks/suites.py`.
+`delphi eval` is leakage-first (§2.6): every scored report carries a leakage-audit
+section (or an explicit NOT-RUN warning) plus the trials-ledger state (§2.4), and
+it refuses to run without a durable Postgres ledger unless
+`DELPHI_ALLOW_EPHEMERAL_TRIALS_LEDGER=1` explicitly opts into an ephemeral one.
+Eval- and harvest-recorded questions carry `benchmark_question_id` metadata (so
+`delphi resolve --suite` can close them into calibration corpus), and the
+benchmark's market/crowd `freeze_value` rides metadata into the chain as a
+synthetic as-of `market_freeze` Evidence item (knowledge_time == as-of; the
+market-anchored agent anchors on it, and every draw prompt carries a
+near-random-walk discipline note for asset-price questions). Series-direction
+questions (fred/yfinance/dbnomics benchmark ids) additionally get a
+deterministic `series_estimator` Evidence item: the empirical P(higher at
+resolution) computed from the series' own as-of history (`sources/series.py`
+keyless FRED/Yahoo/DBnomics providers + `forecaster/stages/series_estimate.py`,
+season-matched, Laplace-smoothed; disable with `DELPHI_SERIES_ESTIMATOR=0`
+for ablations). The live loop
+feeds the Stage-2 corpus: harvest writes the pending (question, workflow,
+evidence, forecast) tuple to the `FileCorpusStore` at `DELPHI_CORPUS_PATH`
+(default `~/.delphi/corpus.jsonl`), and the score tick completes it with the
+resolution + proper score.
+The published API also carries an **async job surface** (`api/jobs.py`):
+`POST /v1/forecast/jobs` (202 + job id, `idempotency_key` = one job per key,
+no duplicate spend) and `GET /v1/forecast/jobs/{id}?wait=N` (long-poll, N
+clamped to 90s) — hosted front-ends cap request time below a real forecast's
+duration (App Runner: hard 120s + CPU throttled to ~0 between requests, so
+the open long-poll is also what keeps the in-process worker at full speed).
+Jobs persist to Postgres when `DELPHI_PG_DSN` is set (any worker/instance can
+answer a poll; claim guard = at-most-one execution; `DELPHI_JOB_WORKERS`,
+`DELPHI_JOB_TIMEOUT_S` tune it); execution reuses the synchronous forecast
+path unchanged (registry record, leakage gate, explicit as-of). The learned
+conductor remains the main deferred milestone.*

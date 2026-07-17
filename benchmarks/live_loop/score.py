@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
+from conductor.corpus import CorpusWriter
 from core.registry.store import RegistryStore
 from evaluation.scoring import BrierScorer, LogScorer, ScoredRecord, mean_score
 from resolution.service import ResolutionService
@@ -74,12 +75,28 @@ class ScoreRun:
 class ScoreJob:
     """Resolves matured questions and recomputes the live metrics."""
 
-    def __init__(self, *, store: RegistryStore, resolution_service: ResolutionService) -> None:
+    def __init__(
+        self,
+        *,
+        store: RegistryStore,
+        resolution_service: ResolutionService,
+        corpus_writer: CorpusWriter | None = None,
+    ) -> None:
         self._store = store
         self._resolution = resolution_service
+        self._corpus_writer = corpus_writer
 
     def run(self, *, since: datetime | None = None) -> ScoreRun:
         """Resolve matured questions, then score all resolved forecasts."""
         resolution_run = self._resolution.resolve_open(since=since)
+        if self._corpus_writer is not None:
+            # Close the Stage-2 corpus loop: every pending tuple whose question
+            # now has a resolution is re-assembled with it + the proper score.
+            # Full scan rather than this tick's resolution ids, so resolutions
+            # that landed out-of-band (an earlier failed tick, `delphi resolve`)
+            # complete their tuples too; refresh() is an idempotent no-op for
+            # everything else.
+            for question in self._store.all_questions():
+                self._corpus_writer.refresh(question.question_id)
         metrics = LiveMetrics.from_records(collect_scored_records(self._store))
         return ScoreRun(resolved=resolution_run.resolved, metrics=metrics)

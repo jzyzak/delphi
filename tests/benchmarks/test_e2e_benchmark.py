@@ -72,7 +72,7 @@ class TestRetrospectiveEndToEnd:
 
         # Deterministic raw forecasts (the real forecaster_fn is unit-tested
         # separately; here we drive the assembly/calibration/scoring end to end).
-        def forecast_fn(_text: str, _as_of: datetime) -> QuestionForecast:
+        def forecast_fn(_text: str, _as_of: datetime, _metadata: Any = None) -> QuestionForecast:
             trace = Trace(
                 component=TraceComponent.SEARCH,
                 as_of=datetime(2026, 1, 1, tzinfo=UTC),

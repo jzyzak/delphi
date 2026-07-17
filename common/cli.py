@@ -10,9 +10,11 @@ probes) is injectable so the CLI is testable without network or DB (CLAUDE.md
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
-from dataclasses import dataclass
+import json
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from api.server import DelphiApp
@@ -22,10 +24,19 @@ from benchmarks.live_loop.harvest import HarvestJob
 from benchmarks.live_loop.score import ScoreJob
 from common.doctor import Probe, format_report, run_checks
 from conductor.heuristic import HeuristicConductor
+from core.orchestration.budget import BudgetLedger
 from core.orchestration.meta.holdout import HoldoutGovernor
 from core.orchestration.run_state import RunStateStore
 from core.registry.store import InMemoryRegistryStore, RegistryStore
+from evaluation.baselines import Baseline
+from evaluation.calibration_split import (
+    assign_calibration_split,
+    fit_calibration_artifact,
+    question_fingerprint,
+)
 from evaluation.report import EvalContext, render_leakage_audit, render_report
+from evaluation.scoring import ScoredRecord
+from forecaster.calibration_artifact import artifact_filename
 from forecaster.chain import Forecaster
 from intake.llm import StructuredLLM
 from intake.service import IntakeService
@@ -110,6 +121,78 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report leakage rate + flagged-at-chance robustness instead of scores.",
     )
+    eval_parser.add_argument(
+        "--calibration-artifact",
+        dest="calibration_artifact",
+        default=None,
+        help=(
+            "Path to a pre-fitted calibration artifact (from `delphi calibration "
+            "fit` on a disjoint corpus): applied to ALL questions, all scored."
+        ),
+    )
+    eval_parser.add_argument(
+        "--no-search",
+        dest="no_search",
+        action="store_true",
+        help="Ablation arm: forecast with an empty evidence searcher (no retrieval).",
+    )
+    eval_parser.add_argument(
+        "--only-sources",
+        dest="only_sources",
+        default=None,
+        metavar="SRC[,SRC...]",
+        help=(
+            "forecastbench only: restrict to question families by composite-id "
+            "prefix (e.g. fred,dbnomics) for a targeted domain eval."
+        ),
+    )
+    eval_parser.add_argument(
+        "--exclude-fit-questions",
+        dest="exclude_fit_questions",
+        action="store_true",
+        help=(
+            "Artifact mode: drop questions in the artifact's fit set BEFORE "
+            "forecasting (never scored, never charged; §2.5) instead of "
+            "refusing the whole run. The exclusion count is reported."
+        ),
+    )
+    eval_parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Stratified deterministic subsample of N questions (see --sample-seed).",
+    )
+    eval_parser.add_argument(
+        "--sample-seed",
+        dest="sample_seed",
+        type=int,
+        default=0,
+        help="Seed for --sample; identical (N, seed) yields identical questions.",
+    )
+    eval_parser.add_argument(
+        "--dump-forecasts",
+        dest="dump_forecasts",
+        default=None,
+        help="Write the scored {question_id: probability} JSON to this path.",
+    )
+    eval_parser.add_argument(
+        "--extra-baseline",
+        dest="extra_baselines",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Add a baseline from a dumped forecasts JSON (repeatable).",
+    )
+    eval_parser.add_argument(
+        "--resume-file",
+        dest="resume_file",
+        default=None,
+        help=(
+            "JSONL progress log: forecasts persist as they complete, and an "
+            "interrupted run rerun with the same file resumes instead of "
+            "re-forecasting. Use a fresh file per run configuration."
+        ),
+    )
 
     conductor = sub.add_parser(
         "conductor", help="Forecast via the heuristic conductor (records a workflow trace)."
@@ -138,6 +221,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--suite",
         default="metaculus",
         help="Benchmark suite to harvest/score (metaculus | forecastbench).",
+    )
+
+    calibration = sub.add_parser(
+        "calibration", help="Fit / manage the learned calibration artifact (§2.5)."
+    )
+    calibration_sub = calibration.add_subparsers(dest="calibration_command", required=True)
+    fit = calibration_sub.add_parser(
+        "fit",
+        help="Fit recalibrator + alpha + floor on the disjoint calibration split.",
+    )
+    fit.add_argument(
+        "--output",
+        default=".",
+        help="Artifact output path; a directory gets a versioned calibration-<date>-<hash>.json.",
+    )
+    fit.add_argument(
+        "--method",
+        default="auto",
+        choices=("auto", "isotonic", "platt"),
+        help="Recalibrator family ('auto' selects by K-fold CV within the split).",
+    )
+    fit.add_argument(
+        "--fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of eligible (non-reserved) resolved questions to fit on.",
+    )
+    fit.add_argument("--seed", type=int, default=0, help="Split/CV seed (deterministic).")
+    fit.add_argument(
+        "--holdout-file",
+        dest="holdout_file",
+        default=None,
+        help="Path to a JSON array of question ids to exclude (the guarded set).",
     )
 
     serve = sub.add_parser("serve", help="Serve the published OpenAI-compatible API.")
@@ -305,20 +421,180 @@ def cmd_serve(args: argparse.Namespace, *, app: DelphiApp) -> int:
     return 0  # pragma: no cover - unreachable while serving
 
 
-def cmd_eval(args: argparse.Namespace, *, context: EvalContext) -> int:
-    """Score a suite (or run a leakage audit) and print the report."""
-    judge = context.judge
-    if (args.leakage_audit or args.with_leakage_audit) and judge is None:
-        print("No leakage judge configured for this suite.")
+def _resolved_forecast_records(store: RegistryStore) -> list[ScoredRecord]:
+    """Collect (raw probability, outcome) pairs for every resolved binary question.
+
+    Uses the *raw* (pre-recalibration) probability recorded in the forecast's
+    calibration metadata so the fit maps raw ensemble output to outcomes — the
+    same composition the chain applies at inference time.
+    """
+    records: list[ScoredRecord] = []
+    for question in store.all_questions():
+        resolutions = [
+            r for r in store.resolutions_for(question.question_id) if r.resolved_value in (0.0, 1.0)
+        ]
+        if not resolutions:
+            continue
+        resolution = max(resolutions, key=lambda r: r.resolved_at)
+        forecasts = store.forecasts_for(question.question_id)
+        if not forecasts:
+            continue
+        forecast = max(forecasts, key=lambda f: f.as_of)
+        raw = forecast.calibration_metadata.get("raw_probability", forecast.probability)
+        if raw is None:
+            continue
+        records.append(
+            ScoredRecord(
+                question_id=question.question_id,
+                domain=question.domain,
+                probability=float(raw),
+                outcome=float(resolution.resolved_value),
+            )
+        )
+    return records
+
+
+def _load_holdout_ids(path: str) -> frozenset[str]:
+    """Read a JSON array of question ids to exclude from the fit (the guarded set)."""
+    data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not all(isinstance(v, str) for v in data):
+        msg = f"holdout file {path} must contain a JSON array of question-id strings."
+        raise ValueError(msg)
+    return frozenset(data)
+
+
+def _fit_question_fingerprints(
+    store: RegistryStore, split_records: Sequence[ScoredRecord]
+) -> list[str]:
+    """Fingerprint every fitted question: registry id + text + benchmark id.
+
+    The benchmark identity is taken from the question's metadata AND from any
+    resolution's ``resolved_label`` — backfilled resolutions carry the
+    benchmark id there when the question predates benchmark-id metadata, and a
+    fit question whose benchmark id escapes the artifact could silently be
+    re-scored by a later artifact-mode eval (§2.5).
+    """
+    from resolution.benchmark_source import BENCHMARK_QUESTION_ID_KEY
+
+    fingerprints: set[str] = set()
+    for record in split_records:
+        fingerprints.add(question_fingerprint(record.question_id))
+        question = store.get_question(record.question_id)
+        fingerprints.add(question_fingerprint(question.text))
+        benchmark_id = question.metadata.get(BENCHMARK_QUESTION_ID_KEY)
+        if benchmark_id:
+            fingerprints.add(question_fingerprint(str(benchmark_id)))
+        for resolution in store.resolutions_for(record.question_id):
+            if resolution.resolved_label:
+                fingerprints.add(question_fingerprint(resolution.resolved_label))
+    return sorted(fingerprints)
+
+
+def cmd_calibration_fit(
+    args: argparse.Namespace,
+    *,
+    store: RegistryStore,
+    clock: Callable[[], datetime] | None = None,
+) -> int:
+    """Fit the calibration artifact on the disjoint calibration split (§2.5)."""
+    try:
+        holdout_ids = _load_holdout_ids(args.holdout_file) if args.holdout_file else frozenset()
+    except (OSError, ValueError) as exc:  # JSONDecodeError is a ValueError
+        print(f"Cannot read holdout file: {exc}")
         return 1
+    records = _resolved_forecast_records(store)
+    split = assign_calibration_split(
+        [r.question_id for r in records],
+        holdout_ids=holdout_ids,
+        fraction=args.fraction,
+        seed=args.seed,
+    )
+    split_records = [r for r in records if r.question_id in split]
+    if not split_records:
+        print(
+            "No resolved forecasts available in the calibration split; nothing to fit. "
+            "Resolve some questions first (`delphi resolve`)."
+        )
+        return 1
+    artifact = fit_calibration_artifact(split_records, method=args.method, seed=args.seed)
+    now = clock() if clock is not None else datetime.now(UTC)
+    data = artifact.to_dict()
+    data["fitted"] = {
+        "fitted_at": now.isoformat(),
+        "n": len(split_records),
+        "seed": args.seed,
+        "fraction": args.fraction,
+        "n_holdout_excluded": len(holdout_ids),
+        "method_requested": args.method,
+        # §2.5 disjointness: artifact-mode eval refuses to score any question
+        # that fingerprints into the fit set (registry id, normalized text,
+        # or the originating benchmark question id).
+        "question_fingerprints": _fit_question_fingerprints(store, split_records),
+    }
+    if artifact.fallback:
+        print(
+            f"WARNING: only {len(split_records)} fit point(s) — below the trust "
+            "threshold. Wrote the labeled IDENTITY FALLBACK artifact (raw "
+            "pass-through); grow the calibration corpus and refit."
+        )
+    out = Path(args.output).expanduser()
+    path = out / artifact_filename(data, date=now.strftime("%Y%m%d")) if out.is_dir() else out
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    floor_text = "none" if artifact.floor is None else f"{artifact.floor:g}"
+    print(
+        f"Fitted {artifact.recalibrator.method} recalibrator on {len(split_records)} "
+        f"resolved question(s): alpha={artifact.alpha:g}, floor={floor_text}."
+    )
+    print(f"Artifact written to {path}")
+    print(f"Export DELPHI_CALIBRATION_ARTIFACT={path} to use it in the live chain.")
+    return 0
+
+
+def _load_extra_baselines(specs: Sequence[str]) -> list[Baseline]:
+    """Parse ``NAME=PATH`` specs into baselines from dumped forecast JSONs."""
+    baselines: list[Baseline] = []
+    for spec in specs:
+        name, separator, path = spec.partition("=")
+        if not separator or not name.strip() or not path.strip():
+            msg = f"--extra-baseline expects NAME=PATH, got {spec!r}"
+            raise ValueError(msg)
+        data = json.loads(Path(path.strip()).expanduser().read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            msg = f"baseline file {path!r} must be a JSON object of question_id -> probability."
+            raise ValueError(msg)
+        predictions = {str(qid): float(p) for qid, p in data.items()}
+        baselines.append(Baseline(name=name.strip(), predictions=predictions))
+    return baselines
+
+
+def cmd_eval(args: argparse.Namespace, *, context: EvalContext) -> int:
+    """Score a suite and print the report (leakage audit always included, §2.6).
+
+    ``--leakage-audit`` renders the audit alone (no scores, no ledger draw);
+    the default scored report carries its own leakage section regardless.
+    """
     if args.leakage_audit:
-        assert judge is not None  # guarded above
-        print(render_leakage_audit(judge, context.inputs.traces))
+        if context.judge is None:
+            print("No leakage judge configured for this suite.")
+            return 1
+        print(render_leakage_audit(context.judge, context.inputs.traces))
         return 0
-    print(render_report(context.inputs, harness=context.harness))
-    if args.with_leakage_audit:
-        assert judge is not None  # guarded above
-        print(render_leakage_audit(judge, context.inputs.traces))
+    inputs = context.inputs
+    extra_specs = getattr(args, "extra_baselines", None) or []
+    if extra_specs:
+        try:
+            extra = _load_extra_baselines(extra_specs)
+        except (OSError, ValueError) as exc:  # JSONDecodeError is a ValueError
+            print(f"Cannot load extra baseline: {exc}")
+            return 1
+        inputs = replace(inputs, baselines=(*inputs.baselines, *extra))
+    dump_path = getattr(args, "dump_forecasts", None)
+    if dump_path:
+        forecasts = {r.question_id: r.probability for r in inputs.records}
+        target = Path(dump_path).expanduser()
+        target.write_text(json.dumps(forecasts, indent=2, sort_keys=True), encoding="utf-8")
+        print(f"Dumped {len(forecasts)} forecast(s) to {target}")
+    print(render_report(inputs, harness=context.harness, judge=context.judge))
     return 0
 
 
@@ -341,6 +617,7 @@ def _default_store() -> RegistryStore:  # pragma: no cover - requires Postgres
 
 
 _DEFAULT_SNAPSHOT_DIR = "~/.delphi/snapshots"
+_DEFAULT_CORPUS_PATH = "~/.delphi/corpus.jsonl"
 
 
 def _snapshot_store(snapshot_dir: str | None) -> Any:  # pragma: no cover - filesystem side effect
@@ -353,24 +630,25 @@ def _snapshot_store(snapshot_dir: str | None) -> Any:  # pragma: no cover - file
     return FileSnapshotStore(root)
 
 
-_EVIDENCE_PROVIDERS = ("tavily", "gdelt", "wikipedia")
-
-# Wikimedia and GDELT both require polite clients: a descriptive User-Agent
-# (Wikimedia robot policy returns 403 without one) and modest pacing (GDELT's
-# keyless API 429s under bursts).
+_EVIDENCE_PROVIDERS = ("tavily", "gdelt", "wikipedia", "none")
+_DEFAULT_EVIDENCE_PROVIDERS = "tavily,gdelt,wikipedia"
+# Wikimedia's robot policy requires a descriptive User-Agent WITH a contact
+# point (URL or email) — a bare product string gets a 403.
 _EVIDENCE_USER_AGENT = "DELPHI-forecaster/0.1 (+https://github.com/jzyzak/delphi)"
 
 
-def _evidence_provider_names(env: dict[str, str] | None = None) -> tuple[str, ...]:
-    """Parse DELPHI_EVIDENCE_PROVIDERS (comma-separated; default: tavily).
+def _evidence_provider_names(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Parse DELPHI_EVIDENCE_PROVIDERS (comma-separated; default: all providers).
 
-    Order is preserved and duplicates removed; unknown names raise so a typo
-    cannot silently drop an evidence source.
+    Unknown names raise; duplicates collapse (order-preserving). Tavily serves
+    current news, GDELT and Wikipedia serve *historical* as-of evidence —
+    retrospective benchmarks are meaningless without the latter two. ``none``
+    is the explicit no-search arm for ablations and must stand alone.
     """
     import os
 
-    e = env if env is not None else dict(os.environ)
-    raw = e.get("DELPHI_EVIDENCE_PROVIDERS") or "tavily"
+    e = os.environ if env is None else env
+    raw = e.get("DELPHI_EVIDENCE_PROVIDERS") or _DEFAULT_EVIDENCE_PROVIDERS
     names: list[str] = []
     for part in raw.split(","):
         name = part.strip().lower()
@@ -385,53 +663,47 @@ def _evidence_provider_names(env: dict[str, str] | None = None) -> tuple[str, ..
     if not names:
         msg = "DELPHI_EVIDENCE_PROVIDERS must name at least one provider."
         raise ValueError(msg)
+    if "none" in names and len(names) > 1:
+        msg = "'none' (the no-search ablation arm) cannot be combined with providers."
+        raise ValueError(msg)
     return tuple(names)
 
 
-def _default_forecaster() -> Forecaster:  # pragma: no cover - requires LLM API + hosted search
-    from common.composition import build_postgres_composition
+def _build_evidence_searchers(
+    settings: Any, snapshot_store: Any, provider_names: Sequence[str]
+) -> dict[str, Any]:  # pragma: no cover - requires network providers
+    """Build one AsOfSearcher per enabled provider, each with a polite client."""
     from common.http.client import HttpClient
     from common.http.config import HttpConfig
-    from common.llm import LLMConfig
     from common.secrets import EnvSecretProvider
-    from core.forecast.bayesian import BedrockEvidenceLikelihoodLLM
-    from core.forecast.leakage_judge import BedrockLeakageJudgeLLM, LeakageJudge
-    from core.forecast.llm import BedrockForecastLLM
-    from core.forecast.supervisor import BedrockSupervisorLLM, Confidence
-    from forecaster.stages.aggregate import SupervisorTuning
-    from sources.providers.tavily import TavilySearchClient, tavily_config
+    from sources.searcher import build_as_of_searcher
 
-    comp = build_postgres_composition()
-    settings = comp.settings
-    # Reasoning-grade config: adaptive thinking + high effort + headroom for
-    # the reasoning tokens (anthropic transport only; see common/llm/config.py).
-    reasoning_cfg = LLMConfig(thinking="adaptive", effort="high", max_tokens=4096)
-    reasoning = comp.structured_client("opus", config=reasoning_cfg)
-    http = HttpClient(config=HttpConfig(user_agent=settings.http_user_agent))
-    snapshot_store = _snapshot_store(settings.snapshot_dir)
-    provider_names = _evidence_provider_names()
-    searchers = []
+    searchers: dict[str, Any] = {}
     for name in provider_names:
         if name == "tavily":
+            from sources.providers.tavily import TavilySearchClient, tavily_config
+
+            http = HttpClient(config=HttpConfig(user_agent=settings.http_user_agent))
             tavily = TavilySearchClient(
                 http=http, config=tavily_config(), secrets=EnvSecretProvider()
             )
-            searchers.append(
-                comp.hosted_searcher(http_client=http, client=tavily, snapshot_store=snapshot_store)
+            searchers[name] = build_as_of_searcher(
+                http_client=http, client=tavily, snapshot_store=snapshot_store
             )
         elif name == "gdelt":
             from sources.providers.gdelt import GdeltAsOfSearcher
 
+            # A GDELT 429 is an IP cooldown: retrying deepens it, so single-
+            # attempt with a 6s politeness interval; the composite skips it
+            # on failure rather than stalling the whole gather.
             gdelt_http = HttpClient(
                 config=HttpConfig(
                     user_agent=settings.http_user_agent or _EVIDENCE_USER_AGENT,
                     min_interval_s=6.0,
-                    # A 429 from GDELT means an IP cooldown: retrying deepens
-                    # it. One attempt; the composite skips the provider.
                     max_retries=1,
                 )
             )
-            searchers.append(GdeltAsOfSearcher(http=gdelt_http, snapshot_store=snapshot_store))
+            searchers[name] = GdeltAsOfSearcher(http=gdelt_http, snapshot_store=snapshot_store)
         elif name == "wikipedia":
             from sources.providers.wikipedia import WikipediaAsOfSearcher
 
@@ -441,14 +713,114 @@ def _default_forecaster() -> Forecaster:  # pragma: no cover - requires LLM API 
                     min_interval_s=1.0,
                 )
             )
-            searchers.append(WikipediaAsOfSearcher(http=wiki_http, snapshot_store=snapshot_store))
-    if len(searchers) == 1:
-        searcher = searchers[0]
-    else:
-        from sources.searcher import CompositeAsOfSearcher
+            searchers[name] = WikipediaAsOfSearcher(http=wiki_http, snapshot_store=snapshot_store)
+    return searchers
 
-        searcher = CompositeAsOfSearcher(searchers)
+
+def _default_forecaster(
+    providers: tuple[str, ...] | None = None,
+) -> Forecaster:  # pragma: no cover - requires LLM API + hosted search
+    from common.composition import build_postgres_composition
+    from common.llm import LLMConfig
+    from core.forecast.search import FixtureAsOfSearch
+    from sources.searcher import CompositeAsOfSearcher
+
+    comp = build_postgres_composition()
+    settings = comp.settings
+    # Reasoning-grade config: adaptive thinking + high effort + headroom for
+    # the reasoning tokens (anthropic transport only; see common/llm/config.py).
+    reasoning_cfg = LLMConfig(thinking="adaptive", effort="high", max_tokens=4096)
+    reasoning = comp.structured_client("opus", config=reasoning_cfg)
+    provider_names = providers if providers is not None else _evidence_provider_names()
+    if provider_names == ("none",):
+        # The explicit no-search ablation arm: an always-empty searcher and no
+        # agentic wrap (planner rounds against nothing waste LLM budget).
+        return _build_forecaster(comp, reasoning, FixtureAsOfSearch(default=()))
+
+    snapshot_store = _snapshot_store(settings.snapshot_dir)
+    by_name = _build_evidence_searchers(settings, snapshot_store, provider_names)
+
+    def _composite(names: Sequence[str]) -> Any:
+        members = [by_name[n] for n in names]
+        return members[0] if len(members) == 1 else CompositeAsOfSearcher(members)
+
+    all_names = list(by_name)
+    searcher: Any = _composite(all_names)
+    if settings.search_rounds > 1:
+        from core.forecast.agentic_search import AgenticAsOfSearcher, BedrockQueryPlannerLLM
+
+        # GDELT's politeness interval is too slow for the iterative planner
+        # loop: it contributes its one bounded query on the seed round only.
+        follow_up_names = [n for n in all_names if n != "gdelt"] or all_names
+        searcher = AgenticAsOfSearcher(
+            inner=_composite(follow_up_names),
+            planner=BedrockQueryPlannerLLM(comp.structured_client("opus")),
+            max_rounds=settings.search_rounds,
+            max_queries_total=settings.search_queries,
+            seed_inner=_composite(all_names) if "gdelt" in all_names else None,
+        )
+    return _build_forecaster(comp, reasoning, searcher)
+
+
+_SERIES_ESTIMATOR_ENV = "DELPHI_SERIES_ESTIMATOR"
+
+
+def _default_series_estimator(settings: Any) -> Any:  # pragma: no cover - network wiring
+    """Wire the deterministic series-threshold estimator (on by default).
+
+    ``DELPHI_SERIES_ESTIMATOR=0`` disables it (e.g. an ablation arm).
+    """
+    import os
+
+    from common.http.client import HttpClient
+    from common.http.config import HttpConfig
+    from forecaster.stages.series_estimate import SeriesEvidenceEstimator
+    from sources.series import (
+        DbnomicsSeriesProvider,
+        FredSeriesProvider,
+        SeriesRouter,
+        YahooChartSeriesProvider,
+    )
+
+    if os.environ.get(_SERIES_ESTIMATOR_ENV, "1") == "0":
+        return None
+    http = HttpClient(config=HttpConfig(user_agent=settings.http_user_agent))
+    router = SeriesRouter(
+        {
+            "fred": FredSeriesProvider(http=http),
+            "yfinance": YahooChartSeriesProvider(http=http),
+            "dbnomics": DbnomicsSeriesProvider(http=http),
+        }
+    )
+    return SeriesEvidenceEstimator(source=router)
+
+
+def _build_forecaster(
+    comp: Any, reasoning: Any, searcher: Any
+) -> Forecaster:  # pragma: no cover - requires LLM API
+    import logging
+
+    from common.llm import LLMConfig
+    from core.forecast.leakage_judge import BedrockLeakageJudgeLLM, LeakageJudge
+    from core.forecast.llm import BedrockForecastLLM
+    from core.forecast.supervisor import BedrockSupervisorLLM
+    from forecaster.calibration_artifact import load_calibration_artifact
+
+    settings = comp.settings
+    # Reasoning-grade config for the draw/supervisor clients: adaptive thinking
+    # + high effort (anthropic transport only; see common/llm/config.py).
+    reasoning_cfg = LLMConfig(thinking="adaptive", effort="high", max_tokens=4096)
+    if settings.calibration_artifact_path:
+        # A bad artifact must fail loudly here, never silently fall back (§2.5).
+        calibration = load_calibration_artifact(settings.calibration_artifact_path)
+    else:
+        calibration = None
+        logging.getLogger(__name__).warning(
+            "DELPHI_CALIBRATION_ARTIFACT is not set: forecasting with the identity "
+            "recalibrator and fixed alpha. Fit one with `delphi calibration fit`."
+        )
     return Forecaster(
+        series_estimator=_default_series_estimator(settings),
         intake=IntakeService(llm=reasoning, store=comp.registry_store),
         searcher=searcher,
         reasoning_llm=reasoning,
@@ -456,19 +828,11 @@ def _default_forecaster() -> Forecaster:  # pragma: no cover - requires LLM API 
         supervisor_llm=BedrockSupervisorLLM(comp.structured_client("fable", config=reasoning_cfg)),
         leakage_judge=LeakageJudge(BedrockLeakageJudgeLLM(comp.structured_client("opus"))),
         registry_store=comp.registry_store,
-        # Bayesian path: prior = reference-class base rate, per-draw evidence
-        # log-LRs combined in log-odds space (fights no-evidence 0.5 collapse).
-        evidence_likelihood_llm=BedrockEvidenceLikelihoodLLM(
-            comp.structured_client("opus", config=reasoning_cfg)
-        ),
-        bayesian_draws=12,
-        runs_per_agent=3,
-        aggregator="trimmed_mean",
-        # Looser trigger + MEDIUM apply gate: a 12-draw ensemble has meaningful
-        # spread, and the supervisor may improve on the aggregate more often.
-        supervisor_tuning=SupervisorTuning(
-            spread_threshold=0.08, min_apply_confidence=Confidence.MEDIUM
-        ),
+        calibration=calibration,
+        aggregator=settings.aggregator,
+        runs_per_agent=settings.runs_per_agent,
+        evidence_subset_fraction=settings.evidence_subset_fraction,
+        max_subquestion_searches=settings.subquestion_searches,
     )
 
 
@@ -575,7 +939,59 @@ def _filter_eval_records(
     return out
 
 
-def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - network + LLM + DB
+_EPHEMERAL_LEDGER_ENV = "DELPHI_ALLOW_EPHEMERAL_TRIALS_LEDGER"
+
+
+def _eval_trials_ledger(
+    *,
+    pg_dsn: str | None,
+    cap: int,
+    env: Mapping[str, str] | None = None,
+) -> BudgetLedger:
+    """Build the §2.4 trials ledger for guarded evals — durable, or loudly not.
+
+    Without Postgres there is no durable global trials count, so guarded
+    evaluation REFUSES to run rather than silently degrading to an unenforced
+    in-process ledger (the §2.4 anti-overfitting guarantee would be void while
+    every number still printed normally). ``DELPHI_ALLOW_EPHEMERAL_TRIALS_LEDGER=1``
+    is the explicit local-development opt-out; the run still warns here and the
+    rendered report still carries the EPHEMERAL-ledger warning.
+    """
+    import os
+
+    from core.orchestration.budget import InMemoryBudgetLedger, PostgresBudgetLedger
+
+    if pg_dsn:
+        return PostgresBudgetLedger.connect(pg_dsn, cap=cap)
+    e = os.environ if env is None else env
+    if e.get(_EPHEMERAL_LEDGER_ENV) == "1":
+        print(
+            "WARNING: DELPHI_PG_DSN is unset — using an EPHEMERAL in-memory "
+            "trials ledger. Draws from this run are NOT recorded durably; the "
+            "global trials count (CLAUDE.md §2.4) is not being enforced."
+        )
+        return InMemoryBudgetLedger(cap=cap)
+    msg = (
+        "No durable trials ledger: DELPHI_PG_DSN is unset, so guarded "
+        "evaluations cannot draw down the global trials budget (CLAUDE.md "
+        "§2.4). Set DELPHI_PG_DSN, or export "
+        f"{_EPHEMERAL_LEDGER_ENV}=1 to explicitly accept an ephemeral, "
+        "non-enforcing ledger for local development."
+    )
+    raise RuntimeError(msg)
+
+
+def _default_eval_context(
+    suite: str,
+    *,
+    calibration_artifact: str | None = None,
+    no_search: bool = False,
+    sample: int | None = None,
+    sample_seed: int = 0,
+    resume_file: str | None = None,
+    exclude_fit_questions: bool = False,
+    only_sources: str | None = None,
+) -> EvalContext:  # pragma: no cover - network + LLM + DB
     """Wire a retrospective evaluation suite (fetch -> adapter -> forecast -> score).
 
     Requires network (benchmark fetch + hosted search), the LLM tiers, and the
@@ -588,19 +1004,24 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
     from benchmarks.forecastbench import ForecastBenchAdapter
     from benchmarks.market_consensus import consensus_baseline
     from benchmarks.metaculus import MetaculusAdapter
-    from benchmarks.suites import build_eval_context, forecaster_fn, records_baseline
+    from benchmarks.suites import (
+        build_eval_context,
+        constant_baseline,
+        forecaster_fn,
+        records_baseline,
+        sample_records,
+    )
     from common.http.client import HttpClient
     from common.http.config import HttpConfig
     from common.secrets import EnvSecretProvider
     from common.settings import load_settings
     from core.forecast.leakage_judge import BedrockLeakageJudgeLLM, LeakageJudge
-    from core.orchestration.budget import InMemoryBudgetLedger, PostgresBudgetLedger
-    from evaluation.baselines import Baseline
     from evaluation.harness import EvalHarness
 
     settings = load_settings()
     http = HttpClient(config=HttpConfig(user_agent=settings.http_user_agent))
-    forecast_fn = forecaster_fn(_default_forecaster())
+    providers = ("none",) if no_search else None
+    forecast_fn = forecaster_fn(_default_forecaster(providers))
 
     baselines: list[Baseline] = []
     resolved_after, max_questions, max_pages = _eval_record_limits()
@@ -612,9 +1033,13 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
         records = _filter_eval_records(
             records, resolved_after=resolved_after, max_questions=max_questions
         )
+        if sample is not None:
+            records = sample_records(records, n=sample, seed=sample_seed)
         adapter: BenchmarkAdapter = MetaculusAdapter.from_records(records)
         baselines.append(consensus_baseline(adapter, price_key="community_prediction"))
     elif suite == "forecastbench":
+        from benchmarks.suites import filter_records_by_source
+
         question_set = os.environ["DELPHI_FORECASTBENCH_QUESTION_SET"]
         resolution_set = os.environ.get("DELPHI_FORECASTBENCH_RESOLUTION_SET")
         records = ForecastBenchFetcher(http=http).fetch(
@@ -623,8 +1048,13 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
         records = _filter_eval_records(
             records, resolved_after=resolved_after, max_questions=max_questions
         )
+        if only_sources:
+            records = filter_records_by_source(records, only_sources.split(","))
+        if sample is not None:
+            records = sample_records(records, n=sample, seed=sample_seed)
         adapter = ForecastBenchAdapter.from_records(records)
         baselines.append(records_baseline(records, source="forecastbench"))
+        baselines.append(constant_baseline(records, source="forecastbench"))
     else:
         valid = ", ".join(_EVAL_SUITES)
         msg = f"unknown --suite {suite!r}; choose one of: {valid}."
@@ -635,11 +1065,16 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
     comp = build_postgres_composition()
     judge = LeakageJudge(BedrockLeakageJudgeLLM(comp.structured_client("opus")))
 
-    cap = settings.global_trials_budget
-    ledger = (
-        PostgresBudgetLedger.connect(settings.pg_dsn, cap=cap)
-        if settings.pg_dsn
-        else InMemoryBudgetLedger(cap=cap, trials_count=lambda: 0)
+    ledger = _eval_trials_ledger(pg_dsn=settings.pg_dsn, cap=settings.global_trials_budget)
+    calibration = None
+    if calibration_artifact:
+        from forecaster.calibration_artifact import load_calibration_artifact
+
+        # A bad artifact must fail loudly, never silently fall back (§2.5).
+        calibration = load_calibration_artifact(calibration_artifact)
+    resume_tag = (
+        f"suite={suite}|no_search={no_search}|artifact={calibration_artifact or ''}"
+        f"|sources={only_sources or ''}"
     )
     return build_eval_context(
         adapter,
@@ -647,6 +1082,10 @@ def _default_eval_context(suite: str) -> EvalContext:  # pragma: no cover - netw
         harness=EvalHarness(budget_ledger=ledger, holdout=_holdout_governor_from_env()),
         judge=judge,
         extra_baselines=tuple(baselines),
+        calibration=calibration,
+        resume_path=resume_file,
+        resume_tag=resume_tag,
+        exclude_fit_questions=exclude_fit_questions,
     )
 
 
@@ -836,13 +1275,21 @@ def _default_live_context(suite: str) -> LiveContext:  # pragma: no cover - netw
         if settings.pg_dsn
         else InMemoryRunStateStore()
     )
+    # Every live harvest/score tick feeds the Stage-2 training corpus (§4):
+    # harvest writes the pending (question, workflow, evidence, forecast) row,
+    # score completes it with the resolution + proper score.
+    from conductor.corpus import CorpusWriter, FileCorpusStore
+
+    corpus_path = os.environ.get("DELPHI_CORPUS_PATH", _DEFAULT_CORPUS_PATH)
+    corpus_writer = CorpusWriter(store=store, corpus=FileCorpusStore(corpus_path))
     return LiveContext(
-        harvest_job=HarvestJob(conductor=_default_conductor()),
+        harvest_job=HarvestJob(conductor=_default_conductor(), corpus_writer=corpus_writer),
         score_job=ScoreJob(
             store=store,
             resolution_service=ResolutionService(
                 store=store, source=BenchmarkResolutionSource(resolutions)
             ),
+            corpus_writer=corpus_writer,
         ),
         adapter=harvest_adapter,
         run_state=run_state,
@@ -857,16 +1304,40 @@ def _default_api_app(
     Bearer auth is enforced when ``auth_token`` is given, or (for local
     ``delphi serve``) when ``DELPHI_SECRET_API_TOKEN`` is set in the environment.
     The production entry point (``api.wsgi``) always passes a token explicitly.
+
+    The async job surface (POST /v1/forecast/jobs) persists jobs to Postgres
+    whenever ``DELPHI_PG_DSN`` is set, so a poll landing on any gunicorn
+    worker/instance sees every job; the in-memory fallback is single-process
+    (local ``delphi serve`` only).
     """
     import os
 
+    from api.jobs import InMemoryJobStore, JobManager, JobStore, PostgresJobStore
     from api.routes import ForecastService
+    from api.server import forecast_runner
+    from common.settings import load_settings
 
     token = auth_token or os.environ.get("DELPHI_SECRET_API_TOKEN") or None
     forecaster = _default_forecaster()
     conductor = HeuristicConductor(forecaster=forecaster)
-    service = ForecastService(forecaster=forecaster, conductor=conductor, store=_default_store())
-    return DelphiApp(service, auth_token=token)
+    store = _default_store()
+    # The API's intake surfaces (/v1/classify, /v1/formalize) preview intake
+    # without recording; the store is only wired for constructor completeness.
+    intake = IntakeService(llm=_default_llm(), store=store)
+    service = ForecastService(
+        forecaster=forecaster, conductor=conductor, store=store, intake=intake
+    )
+    settings = load_settings()
+    job_store: JobStore = (
+        PostgresJobStore.connect(settings.pg_dsn) if settings.pg_dsn else InMemoryJobStore()
+    )
+    jobs = JobManager(
+        store=job_store,
+        runner=forecast_runner(service),
+        workers=settings.job_workers,
+        stale_after_s=float(settings.job_stale_after_s),
+    )
+    return DelphiApp(service, auth_token=token, jobs=jobs)
 
 
 def main(
@@ -881,6 +1352,7 @@ def main(
     live_context: LiveContext | None = None,
     api_app: DelphiApp | None = None,
     doctor_checks: Sequence[tuple[str, Probe]] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> int:
     """Entry point. Dependencies may be injected for tests (no network/DB)."""
     args = build_parser().parse_args(argv)
@@ -911,8 +1383,23 @@ def main(
         )
     if args.command == "eval":
         if eval_context is None:
-            eval_context = _default_eval_context(args.suite)  # pragma: no cover - wired suite
+            eval_context = _default_eval_context(  # pragma: no cover - wired suite
+                args.suite,
+                calibration_artifact=args.calibration_artifact,
+                no_search=args.no_search,
+                sample=args.sample,
+                sample_seed=args.sample_seed,
+                resume_file=args.resume_file,
+                exclude_fit_questions=args.exclude_fit_questions,
+                only_sources=args.only_sources,
+            )
         return cmd_eval(args, context=eval_context)
+    if args.command == "calibration" and args.calibration_command == "fit":
+        return cmd_calibration_fit(
+            args,
+            store=store if store is not None else _default_store(),
+            clock=clock,
+        )
     if args.command == "conductor":
         return cmd_conductor(
             args, conductor=conductor if conductor is not None else _default_conductor()

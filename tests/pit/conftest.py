@@ -9,6 +9,7 @@ import pytest
 
 from core.pit.adapters.fixtures import ingest_synthetic_bars, utc_dt
 from core.pit.store import InMemoryPitStore, PitStore, PostgresPitStore
+from tests.conftest import TEST_PG_DSN_ENV_VAR, postgres_test_dsn
 
 T0 = utc_dt(2024, 1, 1)
 T1 = utc_dt(2024, 1, 5)
@@ -23,7 +24,9 @@ def memory_store() -> InMemoryPitStore:
 
 
 def _postgres_available() -> bool:
-    dsn = os.environ.get("DELPHI_PG_DSN")
+    # Collection-time availability probe (no skip/fail semantics): reads the
+    # dedicated TEST DSN only — fixtures here truncate tables.
+    dsn = os.environ.get(TEST_PG_DSN_ENV_VAR)
     if not dsn:
         return False
     try:
@@ -36,9 +39,7 @@ def _postgres_available() -> bool:
 
 @pytest.fixture
 def postgres_store() -> Iterator[PostgresPitStore]:
-    dsn = os.environ.get("DELPHI_PG_DSN")
-    if not dsn:
-        pytest.skip("DELPHI_PG_DSN not set")
+    dsn = postgres_test_dsn()
     store = PostgresPitStore.connect(dsn, migrate=True)
     try:
         with store._conn.cursor() as cur:  # noqa: SLF001 — test cleanup only
@@ -57,8 +58,8 @@ def pit_store(request: pytest.FixtureRequest) -> PitStore:
         return InMemoryPitStore()
     if backend == "postgres":
         if not _postgres_available():
-            pytest.skip("PostgreSQL not reachable via DELPHI_PG_DSN")
-        store = PostgresPitStore.connect(os.environ["DELPHI_PG_DSN"], migrate=True)
+            pytest.skip(f"PostgreSQL not reachable via {TEST_PG_DSN_ENV_VAR}")
+        store = PostgresPitStore.connect(postgres_test_dsn(), migrate=True)
         with store._conn.cursor() as cur:  # noqa: SLF001
             cur.execute("TRUNCATE pit_facts, pit_universe RESTART IDENTITY")
         store._conn.commit()
@@ -80,7 +81,7 @@ def all_pit_stores(request: pytest.FixtureRequest) -> PitStore:
     """Run leakage tests against every available backend."""
     if request.param == "memory":
         return InMemoryPitStore()
-    store = PostgresPitStore.connect(os.environ["DELPHI_PG_DSN"], migrate=True)
+    store = PostgresPitStore.connect(postgres_test_dsn(), migrate=True)
     with store._conn.cursor() as cur:  # noqa: SLF001
         cur.execute("TRUNCATE pit_facts, pit_universe RESTART IDENTITY")
     store._conn.commit()

@@ -41,6 +41,8 @@ def test_config_defaults_target_tavily() -> None:
     cfg = tavily_config()
     assert cfg.base_url == "https://api.tavily.com/search"
     assert cfg.provider == "tavily"
+    # v2 = server-side end_date bound; retires v1 (as-of-blind) snapshots.
+    assert cfg.version == "v2"
     assert cfg.query_param == "query"
     assert cfg.api_key_secret == TAVILY_API_KEY_SECRET
     assert cfg.extra_params == {"search_depth": "advanced", "topic": "news"}
@@ -72,6 +74,52 @@ def test_search_posts_bearer_body_and_maps_results() -> None:
     }
     assert [r.url for r in response.results] == ["http://before", "http://after", "http://undated"]
     assert response.raw == {"pages": [{"results": _results()}]}
+
+
+def test_search_with_as_of_sends_server_side_end_date() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(req.content.decode("utf-8"))
+        return httpx.Response(200, json={"results": []})
+
+    client = TavilySearchClient(http=_http(handler), secrets=_secrets())
+    client.search("q", as_of=datetime(2024, 6, 1, 12, 30, tzinfo=UTC))
+    assert seen["body"]["end_date"] == "2024-06-01"
+
+
+def test_search_as_of_bound_is_utc_date() -> None:
+    from datetime import timedelta, timezone
+
+    seen: dict[str, Any] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(req.content.decode("utf-8"))
+        return httpx.Response(200, json={"results": []})
+
+    client = TavilySearchClient(http=_http(handler), secrets=_secrets())
+    # 01:00 at UTC+3 is 22:00 the previous day in UTC — the bound must not
+    # admit an extra local-time day past the ceiling.
+    client.search("q", as_of=datetime(2024, 6, 1, 1, 0, tzinfo=timezone(timedelta(hours=3))))
+    assert seen["body"]["end_date"] == "2024-05-31"
+
+
+def test_search_without_as_of_omits_end_date() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(req.content.decode("utf-8"))
+        return httpx.Response(200, json={"results": []})
+
+    client = TavilySearchClient(http=_http(handler), secrets=_secrets())
+    client.search("q")
+    assert "end_date" not in seen["body"]
 
 
 def test_search_without_secrets_sends_no_auth() -> None:
@@ -110,9 +158,13 @@ def test_search_rejects_bad_max_results() -> None:
 
 def test_end_to_end_through_searcher_filters_and_snapshots() -> None:
     calls = {"n": 0}
+    bodies: list[dict[str, Any]] = []
 
-    def handler(_req: httpx.Request) -> httpx.Response:
+    def handler(req: httpx.Request) -> httpx.Response:
+        import json as _json
+
         calls["n"] += 1
+        bodies.append(_json.loads(req.content.decode("utf-8")))
         return httpx.Response(200, json={"results": _results()})
 
     http = _http(handler)
@@ -122,6 +174,8 @@ def test_end_to_end_through_searcher_filters_and_snapshots() -> None:
 
     assert isinstance(searcher, AsOfSearcher)
     evidence = searcher.as_of_search("q", as_of=AS_OF)
+    # The searcher threads the ceiling into the provider request (§2.1).
+    assert bodies[0]["end_date"] == "2024-06-01"
     # Only the pre-as-of, dated result survives; provider tag propagates.
     assert [e.source_id for e in evidence] == ["http://before"]
     assert evidence[0].source == "tavily"

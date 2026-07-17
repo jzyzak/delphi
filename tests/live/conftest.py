@@ -6,6 +6,10 @@ cost money + latency, so they are OFF by default. They run only when
 individually when its own env is absent. Nothing here runs in CI or the default
 ``pytest`` invocation, so the coverage gate is unaffected. This is the operator's
 "does everything actually work?" suite, not a development test.
+
+Deliberate exception to the hermeticity rule (tests/conftest.py): this suite
+probes the REAL production dependencies read-only — it never truncates or
+writes fixture rows — so it uses ``DELPHI_PG_DSN`` via settings on purpose.
 """
 
 from __future__ import annotations

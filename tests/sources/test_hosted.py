@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -14,6 +15,7 @@ from sources.providers.hosted import (
     HostedSearchClient,
     HostedSearchConfig,
     HostedSearchResult,
+    as_of_date_bound,
 )
 
 
@@ -50,6 +52,15 @@ class TestHostedSearchResultFromRaw:
 
     def test_null_published_becomes_none(self) -> None:
         assert HostedSearchResult.from_raw({"published_date": None}).published_date is None
+
+
+class TestAsOfDateBound:
+    def test_renders_utc_date(self) -> None:
+        assert as_of_date_bound(datetime(2024, 6, 1, 12, 30, tzinfo=UTC)) == "2024-06-01"
+
+    def test_converts_non_utc_zone(self) -> None:
+        bound = as_of_date_bound(datetime(2024, 6, 1, 1, 0, tzinfo=timezone(timedelta(hours=3))))
+        assert bound == "2024-05-31"
 
 
 class TestSearch:
@@ -98,6 +109,44 @@ class TestSearch:
         client = HostedSearchClient(http=_http(handler), config=HostedSearchConfig(page_size=10))
         resp = client.search("q", max_results=50)
         assert len(resp.results) == 1
+
+    def test_as_of_param_rides_the_request_when_configured(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["params"] = dict(req.url.params)
+            return httpx.Response(200, json={"results": []})
+
+        client = HostedSearchClient(
+            http=_http(handler), config=HostedSearchConfig(as_of_param="freshness_max")
+        )
+        client.search("q", as_of=datetime(2024, 6, 1, 12, tzinfo=UTC))
+        assert seen["params"]["freshness_max"] == "2024-06-01"
+
+    def test_as_of_omitted_without_configured_param(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["params"] = dict(req.url.params)
+            return httpx.Response(200, json={"results": []})
+
+        client = HostedSearchClient(http=_http(handler))
+        client.search("q", as_of=datetime(2024, 6, 1, tzinfo=UTC))
+        assert "freshness_max" not in seen["params"]
+        assert "2024-06-01" not in seen["params"].values()
+
+    def test_configured_param_ignored_without_as_of(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["params"] = dict(req.url.params)
+            return httpx.Response(200, json={"results": []})
+
+        client = HostedSearchClient(
+            http=_http(handler), config=HostedSearchConfig(as_of_param="freshness_max")
+        )
+        client.search("q")
+        assert "freshness_max" not in seen["params"]
 
     def test_rejects_bad_max_results(self) -> None:
         client = HostedSearchClient(

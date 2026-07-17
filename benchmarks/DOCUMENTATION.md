@@ -171,10 +171,13 @@ cur.execute("INSERT INTO trials_ledger (grant_id, recorded_at) "
   keeps `COUNT(*)` equal to the number of question-evaluations charged against the
   firm-wide cap (`settings.global_trials_budget`, default 100).
 
-**In-memory path.** `InMemoryBudgetLedger` (tests, local dev) delegates the debited
-count to an injected `trials_count` callable and does not itself persist trials —
-its ledger is external by design. Only the Postgres ledger is the durable §2.4
-record.
+**In-memory path.** `InMemoryBudgetLedger` (tests, local dev) counts its own
+committed grants as the debit by default; an injected `trials_count` callable
+overrides that for tests simulating an external count. It is NOT durable
+(`durable = False`) — trials vanish with the process — so `delphi eval` refuses
+to use it unless `DELPHI_ALLOW_EPHEMERAL_TRIALS_LEDGER=1` is exported, and the
+rendered report always carries an EPHEMERAL-ledger warning when it is in play.
+Only the Postgres ledger is the durable §2.4 record.
 
 ---
 
@@ -390,13 +393,18 @@ delphi eval --suite metaculus|forecastbench [--leakage-audit]
      from `DELPHI_FORECASTBENCH_QUESTION_SET` / `..._RESOLUTION_SET` ->
      `ForecastBenchAdapter`; baseline = `records_baseline`.
    - anything else raises with the valid suite names.
-3. Build a `LeakageJudge` (for `--leakage-audit`).
-4. Pick the ledger: `PostgresBudgetLedger` when `DELPHI_PG_DSN` is set, else
-   `InMemoryBudgetLedger(cap=settings.global_trials_budget, ...)`.
+3. Build a `LeakageJudge` (used by the default report's leakage section and
+   `--leakage-audit`).
+4. Pick the ledger: `PostgresBudgetLedger` when `DELPHI_PG_DSN` is set;
+   otherwise REFUSE (no durable §2.4 ledger) unless
+   `DELPHI_ALLOW_EPHEMERAL_TRIALS_LEDGER=1` explicitly opts into an ephemeral
+   `InMemoryBudgetLedger`.
 5. Return `build_eval_context(...)`.
 
-`cmd_eval` then either renders the full report (`render_report`) or, with
-`--leakage-audit`, the leakage audit over the collected traces (`render_leakage_audit`).
+`cmd_eval` renders the full report (`render_report`), which always includes a
+leakage-audit section (§2.6 — the real audit when a judge and traces are
+available, an explicit NOT-RUN warning otherwise) and a trials-ledger section
+(§2.4). `--leakage-audit` renders the audit alone (`render_leakage_audit`).
 Per the Paleka et al. (2026) pitfalls, a retrospective score is not trustworthy until
 its leakage rate is reported.
 
@@ -604,3 +612,32 @@ skipped are the `live` smoke tests gated by `DELPHI_LIVE_SMOKE`), coverage ~93%.
 - **Metaculus community prediction is read from `recency_weighted.latest.centers[0]`**;
   richer aggregation snapshots (e.g. as-of-freeze community values) would sharpen the
   crowd baseline.
+
+## Ablation runs (no-search vs with-search)
+
+The AIA-style control that isolates the evidence layer's contribution and
+detects **parametric leakage** (a model "knowing" post-cutoff outcomes from its
+weights). Both arms run the SAME questions (same `--sample N --sample-seed S`)
+and the SAME pre-fitted calibration artifact (PR: disjoint-corpus mode):
+
+```bash
+# Arm A — no search (null evidence searcher, agentic loop skipped):
+delphi eval --suite forecastbench --sample 50 --sample-seed 7 --no-search \
+  --calibration-artifact artifacts/calibration-<...>.json \
+  --dump-forecasts runs/nosearch.json
+
+# Arm B — full search, with Arm A as a paired baseline:
+delphi eval --suite forecastbench --sample 50 --sample-seed 7 \
+  --calibration-artifact artifacts/calibration-<...>.json \
+  --extra-baseline no_search=runs/nosearch.json
+```
+
+Read the report as: the **with-search delta vs `no_search`** is the retrieval-value
+claim; `uninformed_0.25` (added automatically for forecastbench) is the
+zero-information reference; `market_consensus` is the crowd. **Parametric-leakage
+check:** if the no-search arm approaches market consensus or beats 0.25 by an
+implausible margin *with zero evidence*, the model is answering from training
+memory — flag it, run `--leakage-audit` on both arms, and treat the with-search
+delta as the only publishable number. Ledger note (§2.4): 2×50 = 100 scored
+records = the default `DELPHI_GLOBAL_TRIALS_BUDGET`; raise it explicitly and
+visibly before the run.

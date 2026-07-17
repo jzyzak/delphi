@@ -9,7 +9,7 @@ resolvable questions.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -66,6 +66,37 @@ class IntakeService:
         self._llm = llm
         self._store = store
 
+    def classify(self, question_text: str) -> QuestionClassification:
+        """Classify ``question_text`` into its resolvable shape (no side effects)."""
+        if not question_text or not question_text.strip():
+            msg = "question_text must be a non-empty string."
+            raise ValueError(msg)
+        return classify_question(question_text, llm=self._llm)
+
+    def assess(
+        self,
+        question_text: str,
+        *,
+        as_of: datetime | None = None,
+    ) -> IntakeOutcome:
+        """Classify + normalize + refusal-gate ``question_text`` without recording.
+
+        The non-recording preview of intake (``question_id`` is always ``None``):
+        the registry genesis write stays with :meth:`intake`, so callers that only
+        want the normalized, resolvable form (the API's formalize surface, the
+        CLI preview) never create question records without forecasts.
+        """
+        classification = self.classify(question_text)
+        if classification.question_type is QuestionType.UNKNOWN:
+            decision = assess_refusal(classification, None, as_of=as_of)
+            return IntakeOutcome(False, classification, None, decision, None)
+
+        resolvable = normalize_question(question_text, classification, llm=self._llm)
+        decision = assess_refusal(classification, resolvable, as_of=as_of)
+        if decision.refused:
+            return IntakeOutcome(False, classification, resolvable, decision, None)
+        return IntakeOutcome(True, classification, resolvable, None, None)
+
     def intake(
         self,
         question_text: str,
@@ -80,21 +111,10 @@ class IntakeService:
         through the as-of facade. ``metadata`` is merged into the recorded
         question's metadata (e.g. a benchmark question id for later resolution).
         """
-        if not question_text or not question_text.strip():
-            msg = "question_text must be a non-empty string."
-            raise ValueError(msg)
-
-        classification = classify_question(question_text, llm=self._llm)
-        if classification.question_type is QuestionType.UNKNOWN:
-            decision = assess_refusal(classification, None, as_of=as_of)
-            return IntakeOutcome(False, classification, None, decision, None)
-
-        resolvable = normalize_question(question_text, classification, llm=self._llm)
-        decision = assess_refusal(classification, resolvable, as_of=as_of)
-        if decision.refused:
-            return IntakeOutcome(False, classification, resolvable, decision, None)
-
+        outcome = self.assess(question_text, as_of=as_of)
+        if not outcome.accepted or outcome.resolvable is None:
+            return outcome
         question_id = self._store.record_question(
-            _to_question_input(resolvable, extra_metadata=metadata)
+            _to_question_input(outcome.resolvable, extra_metadata=metadata)
         )
-        return IntakeOutcome(True, classification, resolvable, None, question_id)
+        return replace(outcome, question_id=question_id)

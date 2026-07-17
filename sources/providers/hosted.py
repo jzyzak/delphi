@@ -14,6 +14,7 @@ hardcoded (CLAUDE.md §7). Construction touches no network.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -26,6 +27,7 @@ __all__ = [
     "HostedSearchConfig",
     "HostedSearchResponse",
     "HostedSearchResult",
+    "as_of_date_bound",
 ]
 
 
@@ -41,8 +43,22 @@ class HostedSearchConfig:
     query_param: str = "q"
     count_param: str = "count"
     offset_param: str = "offset"
+    # Name of the provider's "results dated on or before" request param, if it
+    # has one. When set, ``search(as_of=...)`` pushes the as-of ceiling into the
+    # provider query itself (server-side bound, §2.1) instead of relying solely
+    # on the client-side post-filter.
+    as_of_param: str | None = None
     page_size: int = 10
     extra_params: dict[str, str] = field(default_factory=dict)
+
+
+def as_of_date_bound(as_of: datetime) -> str:
+    """Render an as-of ceiling as the provider-facing UTC date string.
+
+    Day granularity: a provider date bound admits same-day-but-later results,
+    so callers must still post-filter exact timestamps via ``filter_as_of``.
+    """
+    return as_of.astimezone(UTC).strftime("%Y-%m-%d")
 
 
 class HostedSearchResult(BaseModel):
@@ -116,7 +132,7 @@ class HostedSearchClient:
         return None
 
     def _fetch_page(
-        self, query: str, *, count: int, offset: int
+        self, query: str, *, count: int, offset: int, as_of: datetime | None = None
     ) -> tuple[list[Any], dict[str, Any]]:
         params: dict[str, Any] = {
             self._config.query_param: query,
@@ -124,6 +140,8 @@ class HostedSearchClient:
             self._config.offset_param: offset,
             **self._config.extra_params,
         }
+        if as_of is not None and self._config.as_of_param is not None:
+            params[self._config.as_of_param] = as_of_date_bound(as_of)
         payload = self._http.get_json(
             self._config.base_url, params=params, headers=self._auth_headers()
         )
@@ -131,8 +149,16 @@ class HostedSearchClient:
         results = raw.get("results", [])
         return (list(results) if isinstance(results, list) else []), raw
 
-    def search(self, query: str, *, max_results: int = 10) -> HostedSearchResponse:
-        """Search for ``query``, returning up to ``max_results`` typed results."""
+    def search(
+        self, query: str, *, max_results: int = 10, as_of: datetime | None = None
+    ) -> HostedSearchResponse:
+        """Search for ``query``, returning up to ``max_results`` typed results.
+
+        ``as_of`` pushes the knowledge-time ceiling into the provider request
+        when the config maps a param for it (§2.1). It never *replaces* the
+        client-side ``filter_as_of`` post-filter — the bound is day-granular
+        and provider enforcement is not trusted on its own.
+        """
         if max_results < 1:
             msg = "max_results must be >= 1."
             raise ValueError(msg)
@@ -141,7 +167,7 @@ class HostedSearchClient:
         offset = 0
         while len(collected) < max_results:
             want = min(self._config.page_size, max_results - len(collected))
-            raw_results, raw = self._fetch_page(query, count=want, offset=offset)
+            raw_results, raw = self._fetch_page(query, count=want, offset=offset, as_of=as_of)
             pages.append(raw)
             if not raw_results:
                 break

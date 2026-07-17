@@ -6,11 +6,21 @@ __all__ = [
     "HttpError",
     "HttpNotFound",
     "HttpRateLimited",
+    "HttpTransportFailure",
 ]
 
 
 class HttpError(RuntimeError):
     """Base class for HTTP transport failures."""
+
+
+class HttpTransportFailure(HttpError):
+    """Network-level failure (connect/handshake/read) after the retry budget.
+
+    Wraps ``httpx.TransportError`` so callers see ONE exception taxonomy: a
+    provider dying on an SSL handshake must be skippable by the composite
+    searcher exactly like a 429, never a raw httpx crash that kills a run.
+    """
 
 
 class HttpRateLimited(HttpError):

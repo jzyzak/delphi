@@ -87,6 +87,26 @@ def _embedding_dim(environ: Mapping[str, str]) -> int:
         raise MissingSettingError(f"DELPHI_EMBEDDING_DIM must be an integer, got {raw!r}") from exc
 
 
+def _int_env(environ: Mapping[str, str], name: str, default: int) -> int:
+    raw = _opt(environ, name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise MissingSettingError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _float_env(environ: Mapping[str, str], name: str, default: float) -> float:
+    raw = _opt(environ, name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise MissingSettingError(f"{name} must be a number, got {raw!r}") from exc
+
+
 class Settings(BaseModel):
     """Immutable, environment-derived application configuration.
 
@@ -143,6 +163,70 @@ class Settings(BaseModel):
         description=(
             "Filesystem root for the durable evidence snapshot store (reproducible, "
             "leakage-auditable retrieval). None -> in-memory (non-persistent)."
+        ),
+    )
+
+    calibration_artifact_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to the fitted calibration artifact JSON (written by `delphi "
+            "calibration fit`, §2.5). None -> identity recalibrator + fixed alpha."
+        ),
+    )
+
+    # Ensemble knobs (§3.4/§3.5). Production defaults: 4 method-agents x 3 runs
+    # = 12 decorrelated draws, pooled in log-odds space, each draw reading a
+    # seeded ~80% evidence subset.
+    runs_per_agent: int = Field(
+        default=3,
+        ge=1,
+        description="Ensemble draws per method-agent (total draws = 4 agents x this).",
+    )
+    aggregator: str = Field(
+        default="log_odds_trimmed_mean",
+        description=(
+            "Ensemble aggregator: log_odds_trimmed_mean | log_odds_mean | median | trimmed_mean."
+        ),
+    )
+    evidence_subset_fraction: float = Field(
+        default=0.8,
+        gt=0.0,
+        le=1.0,
+        description="Per-draw seeded evidence subsample fraction (1.0 disables).",
+    )
+
+    # Agentic search knobs (§1: search quality dominates). Rounds > 1 enables
+    # the LLM-directed iterative retrieval loop around the base searcher.
+    search_rounds: int = Field(
+        default=3,
+        ge=1,
+        description="Agentic search rounds per question (1 = single-shot, no planner).",
+    )
+    search_queries: int = Field(
+        default=8,
+        ge=1,
+        description="Hard cap on provider queries per agentic search invocation.",
+    )
+    subquestion_searches: int = Field(
+        default=3,
+        ge=0,
+        description="Decomposition sub-questions given their own search pass (0 disables).",
+    )
+
+    # Async forecast-job surface (api/jobs.py): hosted front-ends cap request
+    # time (App Runner: 120s hard), so forecasts run out-of-request on a small
+    # per-process worker pool and clients poll for the result.
+    job_workers: int = Field(
+        default=2,
+        ge=1,
+        description="Concurrent async forecast jobs per API process.",
+    )
+    job_stale_after_s: int = Field(
+        default=1800,
+        ge=1,
+        description=(
+            "Seconds a running forecast job may go without completing before "
+            "polls report it failed (worker lost to a crash/restart)."
         ),
     )
 
@@ -206,6 +290,15 @@ class Settings(BaseModel):
             embedding_dim=_embedding_dim(env),
             global_trials_budget=budget,
             snapshot_dir=_opt(env, "DELPHI_SNAPSHOT_DIR"),
+            calibration_artifact_path=_opt(env, "DELPHI_CALIBRATION_ARTIFACT"),
+            runs_per_agent=_int_env(env, "DELPHI_RUNS_PER_AGENT", 3),
+            aggregator=_opt(env, "DELPHI_AGGREGATOR") or "log_odds_trimmed_mean",
+            evidence_subset_fraction=_float_env(env, "DELPHI_EVIDENCE_SUBSET_FRACTION", 0.8),
+            search_rounds=_int_env(env, "DELPHI_SEARCH_ROUNDS", 3),
+            search_queries=_int_env(env, "DELPHI_SEARCH_QUERIES", 8),
+            subquestion_searches=_int_env(env, "DELPHI_SUBQUESTION_SEARCHES", 3),
+            job_workers=_int_env(env, "DELPHI_JOB_WORKERS", 2),
+            job_stale_after_s=_int_env(env, "DELPHI_JOB_TIMEOUT_S", 1800),
             http_user_agent=_opt(env, "DELPHI_HTTP_USER_AGENT"),
             edgar_user_agent=_opt(env, "DELPHI_EDGAR_USER_AGENT"),
             sns_alert_topic_arn=_opt(env, "DELPHI_SNS_ALERT_TOPIC_ARN"),

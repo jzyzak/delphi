@@ -54,6 +54,15 @@ class BudgetSnapshot:
 class BudgetLedger(ABC):
     """Atomic reservation layer over the global trials ledger."""
 
+    @property
+    @abstractmethod
+    def durable(self) -> bool:
+        """Whether committed trials survive this process (§2.4).
+
+        A non-durable ledger cannot enforce the global, append-only trials
+        count across runs — consumers must surface that loudly, never assume it.
+        """
+
     @abstractmethod
     def reserve_budget(self, *, n: int) -> BudgetGrant | None:
         """Atomically reserve ``n`` trials if the firm-wide budget allows."""
@@ -72,13 +81,19 @@ class BudgetLedger(ABC):
 
 
 class InMemoryBudgetLedger(BudgetLedger):
-    """Lock-guarded in-memory budget ledger for tests and local development."""
+    """Lock-guarded in-memory budget ledger for tests and local development.
+
+    NOT durable: committed trials vanish with the process, so this ledger can
+    never enforce the global §2.4 count across runs. By default it at least
+    counts its own committed trials within the process; an injected
+    ``trials_count`` overrides that (tests simulating an external count).
+    """
 
     def __init__(
         self,
         cap: int,
         *,
-        trials_count: Callable[[], int],
+        trials_count: Callable[[], int] | None = None,
     ) -> None:
         if cap < 0:
             msg = "cap must be >= 0."
@@ -87,6 +102,10 @@ class InMemoryBudgetLedger(BudgetLedger):
         self._trials_count = trials_count
         self._lock = threading.Lock()
         self._grants: dict[str, tuple[int, ReservationStatus]] = {}
+
+    @property
+    def durable(self) -> bool:
+        return False
 
     def reserve_budget(self, *, n: int) -> BudgetGrant | None:
         if n <= 0:
@@ -116,8 +135,16 @@ class InMemoryBudgetLedger(BudgetLedger):
         outstanding = sum(
             n for n, status in self._grants.values() if status is ReservationStatus.RESERVED
         )
+        if self._trials_count is not None:
+            debited = self._trials_count()
+        else:
+            # Committed grants ARE the debit — a fixed external count here
+            # would let every fresh reserve see zero spent (§2.4 hole).
+            debited = sum(
+                n for n, status in self._grants.values() if status is ReservationStatus.COMMITTED
+            )
         return BudgetSnapshot(
-            debited=self._trials_count(),
+            debited=debited,
             outstanding_reserved=outstanding,
             cap=self._cap,
         )
@@ -131,6 +158,10 @@ class InMemoryBudgetLedger(BudgetLedger):
 
 class PostgresBudgetLedger(BudgetLedger):
     """PostgreSQL-backed atomic budget reservation."""
+
+    @property
+    def durable(self) -> bool:
+        return True
 
     def __init__(
         self,

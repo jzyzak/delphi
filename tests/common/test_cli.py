@@ -6,12 +6,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from common.cli import build_parser, main
+from common.cli import _evidence_provider_names, build_parser, main
 from core.forecast.leakage_judge import FixtureLeakageJudgeLLM, LeakageJudge
 from core.forecast.llm import FixtureForecastLLM
 from core.forecast.search import Evidence, FixtureAsOfSearch
 from core.forecast.supervisor import FixtureSupervisorLLM
 from core.registry.store import InMemoryRegistryStore
+from evaluation.report import EvalContext
 from forecaster.chain import Forecaster
 from intake.llm import FixtureStructuredLLM
 from intake.service import IntakeService
@@ -198,7 +199,7 @@ def _tmp_answers(contents: str):
     return path
 
 
-def _eval_context() -> object:
+def _eval_context() -> EvalContext:
     from core.forecast.leakage_judge import Trace, TraceComponent
     from core.orchestration.budget import InMemoryBudgetLedger
     from evaluation.harness import EvalHarness
@@ -226,17 +227,118 @@ def _eval_context() -> object:
 
 class TestEvalCommand:
     def test_scores_report(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = main(["eval"], eval_context=_eval_context())  # type: ignore[arg-type]
+        code = main(["eval"], eval_context=_eval_context())
         out = capsys.readouterr().out
         assert code == 0
         assert "Proper scores" in out
         assert "ECE=" in out
 
+    def test_scored_report_carries_leakage_audit_by_default(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Leakage-first (§2.6): the default scored report must include the
+        # audit — it is never a separate opt-in.
+        code = main(["eval"], eval_context=_eval_context())
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "## Leakage audit (§2.6)" in out
+        assert "leakage_rate" in out
+        assert "## Trials ledger (§2.4)" in out
+
     def test_leakage_audit(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = main(["eval", "--leakage-audit"], eval_context=_eval_context())  # type: ignore[arg-type]
+        code = main(["eval", "--leakage-audit"], eval_context=_eval_context())
         out = capsys.readouterr().out
         assert code == 0
         assert "leakage_rate" in out
+
+    def test_dump_forecasts_writes_scored_probabilities(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        import json
+
+        target = tmp_path / "run.json"
+        code = main(
+            ["eval", "--dump-forecasts", str(target)],
+            eval_context=_eval_context(),
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Dumped" in out
+        dumped = json.loads(target.read_text(encoding="utf-8"))
+        assert dumped and all(0.0 <= p <= 1.0 for p in dumped.values())
+
+    def test_extra_baseline_appears_in_report(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        import json
+
+        ctx = _eval_context()
+        baseline_file = tmp_path / "nosearch.json"
+        predictions = {r.question_id: 0.5 for r in ctx.inputs.records}
+        baseline_file.write_text(json.dumps(predictions), encoding="utf-8")
+        code = main(
+            ["eval", "--extra-baseline", f"no_search={baseline_file}"],
+            eval_context=ctx,
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "vs no_search:" in out
+
+    def test_malformed_extra_baseline_fails_loudly(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        bad = tmp_path / "bad.json"
+        bad.write_text("[1, 2, 3]", encoding="utf-8")
+        code = main(
+            ["eval", "--extra-baseline", f"x={bad}"],
+            eval_context=_eval_context(),
+        )
+        assert code == 1
+        assert "Cannot load extra baseline" in capsys.readouterr().out
+
+    def test_extra_baseline_without_equals_fails_loudly(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(
+            ["eval", "--extra-baseline", "just-a-path.json"],
+            eval_context=_eval_context(),
+        )
+        assert code == 1
+        assert "NAME=PATH" in capsys.readouterr().out
+
+    def test_missing_extra_baseline_file_fails_loudly(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        code = main(
+            ["eval", "--extra-baseline", f"x={tmp_path / 'nope.json'}"],
+            eval_context=_eval_context(),
+        )
+        assert code == 1
+        assert "Cannot load extra baseline" in capsys.readouterr().out
+
+    def test_ablation_flags_parse(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "eval",
+                "--suite",
+                "forecastbench",
+                "--no-search",
+                "--sample",
+                "50",
+                "--sample-seed",
+                "7",
+            ]
+        )
+        assert args.no_search is True
+        assert args.sample == 50
+        assert args.sample_seed == 7
+
+    def test_ablation_flags_default_off(self) -> None:
+        args = build_parser().parse_args(["eval"])
+        assert args.no_search is False
+        assert args.sample is None
+        assert args.dump_forecasts is None
+        assert args.extra_baselines == []
 
     def test_leakage_audit_without_judge(self, capsys: pytest.CaptureFixture[str]) -> None:
         from core.orchestration.budget import InMemoryBudgetLedger
@@ -347,6 +449,7 @@ class TestServeCommand:
             forecaster=forecaster,
             conductor=HeuristicConductor(forecaster=forecaster),
             store=store,
+            intake=IntakeService(llm=FixtureStructuredLLM(), store=store),
         )
         code = main(["serve", "--check", "--port", "9001"], api_app=DelphiApp(service))
         out = capsys.readouterr().out
@@ -377,6 +480,304 @@ class TestDoctorCommand:
         assert code == 1
         assert "[FAIL] postgres: RuntimeError: DELPHI_PG_DSN not set" in out
         assert "DOCTOR failed" in out
+
+
+class TestCalibrationFitCommand:
+    @staticmethod
+    def _store_with_resolved_forecast() -> tuple[InMemoryRegistryStore, str]:
+        from core.registry.models import ResolutionInput
+
+        store = InMemoryRegistryStore()
+        result = _forecaster(store).forecast("Will X ship?", as_of=datetime(2024, 6, 1, tzinfo=UTC))
+        assert result.question_id is not None
+        store.record_resolution(
+            ResolutionInput(
+                question_id=result.question_id,
+                resolved_value=1.0,
+                resolved_at=datetime(2025, 7, 1, tzinfo=UTC),
+                source="test",
+            )
+        )
+        return store, result.question_id
+
+    @staticmethod
+    def _clock() -> datetime:
+        return datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+    def test_fits_and_writes_versioned_artifact(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        from evaluation.calibration_split import question_fingerprint
+        from forecaster.calibration_artifact import load_calibration_artifact
+
+        store, question_id = self._store_with_resolved_forecast()
+        code = main(
+            ["calibration", "fit", "--output", str(tmp_path)],
+            store=store,
+            clock=self._clock,
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Fitted platt recalibrator on 1 resolved question(s)" in out
+        # One fit point is below the trust threshold: labeled identity fallback.
+        assert "IDENTITY FALLBACK" in out
+        artifacts = list(tmp_path.glob("calibration-20260715-*.json"))
+        assert len(artifacts) == 1
+        learned = load_calibration_artifact(artifacts[0])
+        assert learned.fitted_meta["fitted_at"] == "2026-07-15T12:00:00+00:00"
+        assert learned.fitted_meta["n"] == 1
+        assert learned.fitted_meta["fallback"] is True
+        # §2.5 disjointness fingerprints: registry id + normalized question text.
+        fingerprints = learned.fitted_meta["question_fingerprints"]
+        assert question_fingerprint(question_id) in fingerprints
+        question = store.get_question(question_id)
+        assert question_fingerprint(question.text) in fingerprints
+
+    def test_fingerprints_include_resolution_label(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        # A backfilled resolution carries the benchmark id in resolved_label
+        # (the question predates benchmark-id metadata); the artifact must
+        # fingerprint it or a later artifact-mode eval could re-score the fit
+        # question undetected (§2.5).
+        from core.registry.models import ResolutionInput
+        from evaluation.calibration_split import question_fingerprint
+        from forecaster.calibration_artifact import load_calibration_artifact
+
+        store = InMemoryRegistryStore()
+        result = _forecaster(store).forecast("Will X ship?", as_of=datetime(2024, 6, 1, tzinfo=UTC))
+        assert result.question_id is not None
+        store.record_resolution(
+            ResolutionInput(
+                question_id=result.question_id,
+                resolved_value=1.0,
+                resolved_at=datetime(2025, 7, 1, tzinfo=UTC),
+                source="forecastbench",
+                resolved_label="forecastbench:acled-abc123",
+            )
+        )
+        code = main(
+            ["calibration", "fit", "--output", str(tmp_path)], store=store, clock=self._clock
+        )
+        assert code == 0
+        artifact = load_calibration_artifact(next(iter(tmp_path.glob("*.json"))))
+        fingerprints = artifact.fitted_meta["question_fingerprints"]
+        assert question_fingerprint("forecastbench:acled-abc123") in fingerprints
+
+    def test_explicit_output_file_path(self, capsys: pytest.CaptureFixture[str], tmp_path) -> None:
+        store, _ = self._store_with_resolved_forecast()
+        target = tmp_path / "my-artifact.json"
+        code = main(
+            ["calibration", "fit", "--output", str(target)],
+            store=store,
+            clock=self._clock,
+        )
+        assert code == 0
+        assert target.exists()
+        assert str(target) in capsys.readouterr().out
+
+    def test_empty_registry_returns_one(self, capsys: pytest.CaptureFixture[str]) -> None:
+        code = main(["calibration", "fit"], store=InMemoryRegistryStore(), clock=self._clock)
+        assert code == 1
+        assert "nothing to fit" in capsys.readouterr().out
+
+    def test_holdout_ids_are_excluded(self, capsys: pytest.CaptureFixture[str], tmp_path) -> None:
+        import json as jsonlib
+
+        store, question_id = self._store_with_resolved_forecast()
+        holdout = tmp_path / "holdout.json"
+        holdout.write_text(jsonlib.dumps([question_id]), encoding="utf-8")
+        code = main(
+            ["calibration", "fit", "--output", str(tmp_path), "--holdout-file", str(holdout)],
+            store=store,
+            clock=self._clock,
+        )
+        assert code == 1
+        assert "nothing to fit" in capsys.readouterr().out
+
+    def test_invalid_holdout_file_returns_one(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        holdout = tmp_path / "holdout.json"
+        holdout.write_text('{"not": "a list"}', encoding="utf-8")
+        code = main(
+            ["calibration", "fit", "--holdout-file", str(holdout)],
+            store=InMemoryRegistryStore(),
+            clock=self._clock,
+        )
+        assert code == 1
+        assert "Cannot read holdout file" in capsys.readouterr().out
+
+    def test_missing_holdout_file_returns_one(
+        self, capsys: pytest.CaptureFixture[str], tmp_path
+    ) -> None:
+        code = main(
+            ["calibration", "fit", "--holdout-file", str(tmp_path / "nope.json")],
+            store=InMemoryRegistryStore(),
+            clock=self._clock,
+        )
+        assert code == 1
+        assert "Cannot read holdout file" in capsys.readouterr().out
+
+    def test_resolved_question_without_forecast_is_skipped(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.registry.models import QuestionInput, ResolutionInput
+
+        store = InMemoryRegistryStore()
+        qid = store.record_question(
+            QuestionInput(
+                text="Will Y happen?",
+                question_type="binary",
+                domain="tech",
+                resolution_criteria="Official announcement.",
+            )
+        )
+        store.record_resolution(
+            ResolutionInput(
+                question_id=qid,
+                resolved_value=0.0,
+                resolved_at=datetime(2025, 7, 1, tzinfo=UTC),
+                source="test",
+            )
+        )
+        code = main(["calibration", "fit"], store=store, clock=self._clock)
+        assert code == 1
+        assert "nothing to fit" in capsys.readouterr().out
+
+    def test_forecast_without_probability_is_skipped(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from core.registry.models import (
+            ForecastInput,
+            Quantile,
+            QuestionInput,
+            ResolutionInput,
+        )
+
+        store = InMemoryRegistryStore()
+        qid = store.record_question(
+            QuestionInput(
+                text="How many units by 2026?",
+                question_type="binary",
+                domain="tech",
+                resolution_criteria="Official count.",
+            )
+        )
+        store.record_forecast(
+            ForecastInput(
+                question_id=qid,
+                as_of=datetime(2024, 6, 1, tzinfo=UTC),
+                quantiles=(Quantile(level=0.5, value=10.0),),
+                rationale="distributional",
+                model_provenance={"forecast_llm": {"model_version": "m"}},
+                repro_handle={"as_of": "2024-06-01T00:00:00+00:00"},
+            )
+        )
+        store.record_resolution(
+            ResolutionInput(
+                question_id=qid,
+                resolved_value=1.0,
+                resolved_at=datetime(2025, 7, 1, tzinfo=UTC),
+                source="test",
+            )
+        )
+        code = main(["calibration", "fit"], store=store, clock=self._clock)
+        assert code == 1
+        assert "nothing to fit" in capsys.readouterr().out
+
+    def test_unresolved_forecasts_are_skipped(self, capsys: pytest.CaptureFixture[str]) -> None:
+        store = InMemoryRegistryStore()
+        _forecaster(store).forecast("Will X ship?", as_of=datetime(2024, 6, 1, tzinfo=UTC))
+        code = main(["calibration", "fit"], store=store, clock=self._clock)
+        assert code == 1
+        assert "nothing to fit" in capsys.readouterr().out
+
+    def test_default_clock_is_used_when_not_injected(self, tmp_path) -> None:
+        store, _ = self._store_with_resolved_forecast()
+        code = main(["calibration", "fit", "--output", str(tmp_path)], store=store)
+        assert code == 0
+        assert list(tmp_path.glob("calibration-*.json"))
+
+    def test_fit_subcommand_is_required(self) -> None:
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["calibration"])
+
+    def test_benchmark_metadata_id_is_fingerprinted(self, tmp_path) -> None:
+        from core.registry.models import ResolutionInput
+        from evaluation.calibration_split import question_fingerprint
+        from forecaster.calibration_artifact import load_calibration_artifact
+        from resolution.benchmark_source import BENCHMARK_QUESTION_ID_KEY
+
+        store = InMemoryRegistryStore()
+        # Thread the benchmark origin through intake metadata, as the live loop does.
+        result = _forecaster(store).forecast(
+            "Will X ship?",
+            as_of=datetime(2024, 6, 1, tzinfo=UTC),
+            metadata={BENCHMARK_QUESTION_ID_KEY: "forecastbench:abc"},
+        )
+        assert result.question_id is not None
+        store.record_resolution(
+            ResolutionInput(
+                question_id=result.question_id,
+                resolved_value=1.0,
+                resolved_at=datetime(2025, 7, 1, tzinfo=UTC),
+                source="test",
+            )
+        )
+        code = main(
+            ["calibration", "fit", "--output", str(tmp_path)], store=store, clock=self._clock
+        )
+        assert code == 0
+        learned = load_calibration_artifact(next(iter(tmp_path.glob("*.json"))))
+        assert (
+            question_fingerprint("forecastbench:abc")
+            in learned.fitted_meta["question_fingerprints"]
+        )
+
+
+class TestEvalCalibrationArtifactFlag:
+    def test_flag_parses(self) -> None:
+        args = build_parser().parse_args(
+            ["eval", "--suite", "forecastbench", "--calibration-artifact", "/tmp/a.json"]
+        )
+        assert args.calibration_artifact == "/tmp/a.json"
+
+    def test_flag_defaults_to_none(self) -> None:
+        args = build_parser().parse_args(["eval"])
+        assert args.calibration_artifact is None
+
+
+class TestEvidenceProviderNames:
+    def test_default_is_all_providers(self) -> None:
+        assert _evidence_provider_names({}) == ("tavily", "gdelt", "wikipedia")
+
+    def test_env_selects_subset(self) -> None:
+        env = {"DELPHI_EVIDENCE_PROVIDERS": "gdelt,wikipedia"}
+        assert _evidence_provider_names(env) == ("gdelt", "wikipedia")
+
+    def test_whitespace_and_case_tolerated(self) -> None:
+        env = {"DELPHI_EVIDENCE_PROVIDERS": " Tavily , GDELT "}
+        assert _evidence_provider_names(env) == ("tavily", "gdelt")
+
+    def test_duplicates_collapse_order_preserving(self) -> None:
+        env = {"DELPHI_EVIDENCE_PROVIDERS": "wikipedia,tavily,wikipedia"}
+        assert _evidence_provider_names(env) == ("wikipedia", "tavily")
+
+    def test_unknown_provider_raises(self) -> None:
+        with pytest.raises(ValueError, match="unknown evidence provider"):
+            _evidence_provider_names({"DELPHI_EVIDENCE_PROVIDERS": "bing"})
+
+    def test_only_commas_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least one provider"):
+            _evidence_provider_names({"DELPHI_EVIDENCE_PROVIDERS": " , ,"})
+
+    def test_none_alone_is_valid(self) -> None:
+        assert _evidence_provider_names({"DELPHI_EVIDENCE_PROVIDERS": "none"}) == ("none",)
+
+    def test_none_combined_with_providers_raises(self) -> None:
+        with pytest.raises(ValueError, match="cannot be combined"):
+            _evidence_provider_names({"DELPHI_EVIDENCE_PROVIDERS": "none,tavily"})
 
 
 class TestParser:
@@ -465,6 +866,53 @@ class TestHoldoutGovernorFromEnv:
             )
 
 
+class TestEvalTrialsLedger:
+    def test_no_dsn_refuses_by_default(self) -> None:
+        from common.cli import _eval_trials_ledger
+
+        with pytest.raises(RuntimeError, match="No durable trials ledger"):
+            _eval_trials_ledger(pg_dsn=None, cap=100, env={})
+
+    def test_opt_in_must_be_exactly_one(self) -> None:
+        from common.cli import _eval_trials_ledger
+
+        with pytest.raises(RuntimeError, match="No durable trials ledger"):
+            _eval_trials_ledger(
+                pg_dsn=None, cap=100, env={"DELPHI_ALLOW_EPHEMERAL_TRIALS_LEDGER": "true"}
+            )
+
+    def test_explicit_opt_in_returns_ephemeral_ledger_with_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from common.cli import _eval_trials_ledger
+        from core.orchestration.budget import InMemoryBudgetLedger
+
+        ledger = _eval_trials_ledger(
+            pg_dsn=None, cap=100, env={"DELPHI_ALLOW_EPHEMERAL_TRIALS_LEDGER": "1"}
+        )
+        assert isinstance(ledger, InMemoryBudgetLedger)
+        assert ledger.durable is False
+        out = capsys.readouterr().out
+        assert "EPHEMERAL" in out
+        assert "§2.4" in out
+
+    def test_dsn_builds_durable_postgres_ledger(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from common.cli import _eval_trials_ledger
+        from core.orchestration.budget import PostgresBudgetLedger
+
+        seen: dict[str, object] = {}
+
+        def fake_connect(dsn: str, *, cap: int) -> str:
+            seen["dsn"] = dsn
+            seen["cap"] = cap
+            return "durable-ledger"
+
+        monkeypatch.setattr(PostgresBudgetLedger, "connect", fake_connect)
+        ledger = _eval_trials_ledger(pg_dsn="postgresql://test", cap=42, env={})
+        assert ledger == "durable-ledger"
+        assert seen == {"dsn": "postgresql://test", "cap": 42}
+
+
 class TestServeAuthWarning:
     def _service(self):
         from api.routes import ForecastService
@@ -472,10 +920,15 @@ class TestServeAuthWarning:
 
         store = InMemoryRegistryStore()
         forecaster = _forecaster(store)
+        # The /v1/classify + /v1/formalize surface needs its own intake seam.
+        intake = IntakeService(
+            llm=FixtureStructuredLLM([_CLASSIFY_BINARY, _FORECAST_NORMALIZE]), store=store
+        )
         return ForecastService(
             forecaster=forecaster,
             conductor=HeuristicConductor(forecaster=forecaster),
             store=store,
+            intake=intake,
         )
 
     def test_warns_when_endpoint_is_open(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -604,7 +1057,11 @@ class TestEvalWithLeakageAudit:
         assert "Proper scores" in out
         assert "leakage_rate" in out
 
-    def test_with_audit_requires_judge(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_without_judge_scored_report_warns_not_run(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # §2.6: the scored report still renders, but must carry the explicit
+        # NOT-RUN leakage warning instead of silently omitting the section.
         from core.orchestration.budget import InMemoryBudgetLedger
         from evaluation.harness import EvalHarness
         from evaluation.report import EvalContext, EvalInputs
@@ -619,30 +1076,5 @@ class TestEvalWithLeakageAudit:
         )
         code = main(["eval", "--with-leakage-audit"], eval_context=ctx)
         out = capsys.readouterr().out
-        assert code == 1
-        assert "No leakage judge" in out
-
-
-class TestEvidenceProviderNames:
-    def test_default_is_tavily(self) -> None:
-        from common.cli import _evidence_provider_names
-
-        assert _evidence_provider_names(env={}) == ("tavily",)
-
-    def test_parses_ordered_unique(self) -> None:
-        from common.cli import _evidence_provider_names
-
-        env = {"DELPHI_EVIDENCE_PROVIDERS": "gdelt, wikipedia,tavily,gdelt"}
-        assert _evidence_provider_names(env=env) == ("gdelt", "wikipedia", "tavily")
-
-    def test_unknown_provider_raises(self) -> None:
-        from common.cli import _evidence_provider_names
-
-        with pytest.raises(ValueError, match="unknown evidence provider"):
-            _evidence_provider_names(env={"DELPHI_EVIDENCE_PROVIDERS": "bing"})
-
-    def test_only_commas_raises(self) -> None:
-        from common.cli import _evidence_provider_names
-
-        with pytest.raises(ValueError, match="at least one"):
-            _evidence_provider_names(env={"DELPHI_EVIDENCE_PROVIDERS": ", ,"})
+        assert code == 0
+        assert "NOT RUN (no leakage judge configured)" in out

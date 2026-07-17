@@ -97,6 +97,77 @@ curl -s "$API/v1/forecast" \
 
 `tier` may be `delphi` (fixed pipeline) or `delphi_deep` (conductor).
 
+The intake surfaces let a client (e.g. a dashboard) type and formalize a
+question cheaply before committing to a full forecast. Both take the same
+body shape as forecast, but `as_of` is optional (it only enables the
+"already resolved" refusal check) and nothing is written to the registry:
+
+```bash
+curl -s "$API/v1/classify" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "Will SpaceX reach orbit with Starship before 2027?"}'
+# -> {"object": "question.classification", "classification": {"question_type": "binary", ...}}
+
+curl -s "$API/v1/formalize" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "Will SpaceX reach orbit with Starship before 2027?"}'
+# -> {"object": "question.formalization", "refused": false,
+#     "formalized": {"text": ..., "resolution_criteria": ..., "close_time": ...}, ...}
+```
+
+A question that cannot be formalized (unresolvable, underspecified, opinion)
+returns `200` with `refused: true` and a `refusal_reason` — refusal is a
+product answer (CLAUDE.md §10), not an HTTP error.
+
+## Long forecasts: the async job API (avoid App Runner's 120s cap)
+
+App Runner enforces a **hard 120-second total request timeout** (not
+configurable; client-side timeouts cannot override it), and a real forecast
+usually runs longer — so the synchronous `POST /v1/forecast` gets killed with
+a 504 mid-forecast. Long-running clients (e.g. a dashboard) must use the
+**async job surface** instead:
+
+```bash
+# 1. Submit: returns 202 + a job id immediately. The idempotency key makes
+#    retries safe — one key maps to exactly one job (no duplicate spend);
+#    resubmitting a key returns the existing job (200) whatever its status.
+JOB=$(curl -s "$API/v1/forecast/jobs" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"question\": \"Will SpaceX reach orbit with Starship before 2027?\", \
+       \"as_of\": \"$NOW\", \"tier\": \"delphi\", \
+       \"idempotency_key\": \"dash-req-42\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 2. Poll with a long-poll wait (seconds, clamped to 90) until terminal:
+curl -s "$API/v1/forecast/jobs/$JOB?wait=60" -H "Authorization: Bearer $TOKEN"
+# -> {"object": "forecast.job", "status": "queued|running|succeeded|failed",
+#     "result": <the full forecast response once succeeded>, "error": ...}
+```
+
+Client loop: submit once with an idempotency key, then `GET ...?wait=60` in a
+loop until `status` is `succeeded` or `failed`, and read the forecast from
+`result` (same shape as the synchronous response). **Use the `wait` long-poll
+rather than rapid short GETs**: App Runner throttles instance CPU to ~0.01
+vCPU when no request is in flight, so the open poll is also what keeps the
+forecast worker running at full speed.
+
+Operational notes:
+
+- Jobs persist in Postgres (`DELPHI_PG_DSN`), so polls can land on any
+  worker/instance. Without a DSN the store is in-memory and single-process
+  (local `delphi serve` only).
+- `DELPHI_JOB_WORKERS` (default 2) caps concurrent forecasts per API process;
+  `DELPHI_JOB_TIMEOUT_S` (default 1800) is the stale timeout after which a
+  running job whose worker died (deploy/crash) is reported `failed` instead of
+  spinning forever. Queued jobs orphaned by a restart are revived by the next
+  poll.
+- The container runs gunicorn with `--threads` (`GUNICORN_THREADS`, default 8)
+  so long-polls cannot starve the worker pool.
+- A refused question is a **succeeded** job whose `result.delphi.refused` is
+  `true` — refusal stays a product answer, not a job failure.
+
 ## Updating the deployed version
 
 ```bash

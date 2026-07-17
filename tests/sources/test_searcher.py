@@ -108,6 +108,15 @@ class _RaisingSearcher:
         raise self._exc
 
 
+class TestCompositionWiring:
+    def test_composition_builds_hosted_searcher(self) -> None:
+        http, _ = _http_counting(_mixed_results())
+        searcher = build_test_composition().hosted_searcher(http_client=http)
+        assert isinstance(searcher, AsOfSearcher)
+        evidence = searcher.as_of_search("q", as_of=AS_OF)
+        assert [e.source_id for e in evidence] == ["http://before"]
+
+
 class TestCompositeAsOfSearcher:
     def test_is_asof_searcher(self) -> None:
         assert isinstance(CompositeAsOfSearcher([]), AsOfSearcher)
@@ -168,6 +177,12 @@ class TestCompositeAsOfSearcher:
         with pytest.raises(ValueError, match="logic bug"):
             CompositeAsOfSearcher([boom]).as_of_search("q", as_of=AS_OF)
 
+    def test_failing_provider_last_still_returns_earlier_results(self) -> None:
+        healthy = FixtureAsOfSearch(default=[_evidence("gdelt", "http://ok", score=0.6)])
+        boom = _RaisingSearcher(HttpNotFound("provider down"))
+        evidence = CompositeAsOfSearcher([healthy, boom]).as_of_search("q", as_of=AS_OF)
+        assert [e.source_id for e in evidence] == ["http://ok"]
+
     def test_score_ties_break_deterministically(self) -> None:
         a = FixtureAsOfSearch(default=[_evidence("wikipedia", "b", score=0.5)])
         b = FixtureAsOfSearch(default=[_evidence("gdelt", "a", score=0.5)])
@@ -180,12 +195,3 @@ class TestCompositeAsOfSearcher:
     def test_rejects_bad_max_items(self) -> None:
         with pytest.raises(ValueError, match="max_items"):
             CompositeAsOfSearcher([], max_items=0)
-
-
-class TestCompositionWiring:
-    def test_composition_builds_hosted_searcher(self) -> None:
-        http, _ = _http_counting(_mixed_results())
-        searcher = build_test_composition().hosted_searcher(http_client=http)
-        assert isinstance(searcher, AsOfSearcher)
-        evidence = searcher.as_of_search("q", as_of=AS_OF)
-        assert [e.source_id for e in evidence] == ["http://before"]

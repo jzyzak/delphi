@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from core.orchestration.budget import BudgetLedger
+from core.orchestration.budget import BudgetLedger, BudgetSnapshot
 from core.orchestration.meta.holdout import HoldoutGovernor
 from evaluation.aggregate import ScoreSummary, summarize_scores
 from evaluation.scoring import ScoredRecord, Scorer
@@ -97,6 +97,18 @@ class EvalHarness:
             raise
         self._ledger.commit(grant)
         return summaries
+
+    def ledger_snapshot(self) -> BudgetSnapshot:
+        """Observed trials-ledger usage, for the rendered report (§2.4).
+
+        Read-only observability — never a path around ``reserve_budget``.
+        """
+        return self._ledger.snapshot()
+
+    @property
+    def ledger_durable(self) -> bool:
+        """Whether the ledger's committed count survives this process (§2.4)."""
+        return self._ledger.durable
 
     def access_holdout(self, *, reason: str) -> Mapping[str, Any]:
         """Access the holdout ONLY through the governor (logged + budgeted)."""

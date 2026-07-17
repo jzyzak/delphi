@@ -8,6 +8,13 @@
 # The host port defaults to 5432 but is overridable via DELPHI_PG_PORT (read from
 # .env) when 5432 is already taken by another Postgres; set DELPHI_PG_DSN to the
 # same port. The image bundles the pgvector extension required by core/memory.
+#
+# Postgres-marked TESTS never run against DELPHI_PG_DSN (they truncate tables
+# and write frozen-clock fixture rows). Create a dedicated test database and
+# export the separate test DSN (tests/conftest.py fails hard if they match):
+#
+#   docker compose exec postgres createdb -U postgres delphi_test
+#   export DELPHI_TEST_PG_DSN="postgresql://postgres:delphi@localhost:5432/delphi_test"
 
 services:
   postgres:

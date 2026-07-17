@@ -25,6 +25,9 @@ tests
 !.env.example
 .delphi
 
+# Local run logs.
+runs
+
 # Infra + docs that don't belong in the image.
 deploy
 docker-compose.yml

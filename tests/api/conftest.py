@@ -60,6 +60,7 @@ def make_service() -> Callable[..., tuple[ForecastService, InMemoryRegistryStore
     def _make(
         *,
         classify: dict = _CLASSIFY,
+        normalize: dict = _NORMALIZE,
         providers: tuple[str, ...] = ("anthropic",),
         price_per_call: float | None = None,
         request_log: MutableSequence[str] | None = None,
@@ -67,10 +68,14 @@ def make_service() -> Callable[..., tuple[ForecastService, InMemoryRegistryStore
         store = InMemoryRegistryStore()
         forecaster = _forecaster(store, classify=classify)
         conductor = HeuristicConductor(forecaster=forecaster)
+        # The intake surface gets its own fixture LLM queue so classify/formalize
+        # calls never consume the forecaster's queued responses.
+        intake = IntakeService(llm=FixtureStructuredLLM([classify, normalize]), store=store)
         service = ForecastService(
             forecaster=forecaster,
             conductor=conductor,
             store=store,
+            intake=intake,
             providers=providers,
             price_per_call=price_per_call,
             request_log=request_log,
